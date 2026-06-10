@@ -1,7 +1,7 @@
 """
 Al Brooks 日内机会寻找训练器 V5.0（完整版）
 核心设计：一次性分析80根K线，输出完整故事
-每根K线都有编号，用户可以精确引用
+每根K线都有编号（从K1开始），用户可以精确引用
 """
 
 import streamlit as st
@@ -47,7 +47,7 @@ FIVE_STEPS = [
 # ==================== AI 提示词 ====================
 STORY_ANALYSIS_SYSTEM = """你是 Al Brooks 价格行为教练。
 
-【重要】用户看到的图表上，每根K线都有编号（K0, K1, K2...K79）。
+【重要】用户看到的图表上，每根K线都有编号（K1, K2, K3...K80）。
 用户必须引用具体的K线编号来说明他的观察。
 
 【你的任务】
@@ -66,8 +66,8 @@ STORY_ANALYSIS_SYSTEM = """你是 Al Brooks 价格行为教练。
 - 控制在150字以内
 
 【图表信息】
-K线范围: K0 ~ K{max_bar}（共{count}根K线）
-整体方向: 从K0的{first_close:.0f}到K{max_bar}的{last_close:.0f}（{direction}）
+K线范围: K1 ~ K{max_bar}（共{count}根K线）
+整体方向: 从K1的{first_close:.0f}到K{max_bar}的{last_close:.0f}（{direction}）
 整体波幅: {lowest:.0f} ~ {highest:.0f}（{range_pct:.1f}%）
 """
 
@@ -82,15 +82,15 @@ def call_story_analyzer(df, max_bar, user_story, conversation_history):
         return "【提示】请配置API密钥\n\n请在 Streamlit Cloud 后台设置 OPENAI_API_KEY"
     
     first_close = df.iloc[0]["close"]
-    last_close = df.iloc[max_bar]["close"]
-    highest = df.iloc[:max_bar+1]["high"].max()
-    lowest = df.iloc[:max_bar+1]["low"].min()
+    last_close = df.iloc[max_bar - 1]["close"] if max_bar > 0 else df.iloc[0]["close"]
+    highest = df.iloc[:max_bar]["high"].max()
+    lowest = df.iloc[:max_bar]["low"].min()
     range_pct = (highest - lowest) / lowest * 100
     direction = "上涨" if last_close > first_close else "下跌" if last_close < first_close else "震荡"
     
     system = STORY_ANALYSIS_SYSTEM.format(
         max_bar=max_bar,
-        count=max_bar + 1,
+        count=max_bar,
         first_close=first_close,
         last_close=last_close,
         direction=direction,
@@ -137,11 +137,17 @@ def load_data(symbol, period="30"):
 
 # ==================== 图表绘制 ====================
 def build_chart(df, max_bar):
-    """绘制完整K线图，每根K线都有编号"""
-    start = max(0, max_bar - 80)
-    plot_df = df.iloc[start:max_bar+1].copy().reset_index(drop=True)
-    original_indices = list(range(start, max_bar+1))
-    n_bars = len(original_indices)
+    """
+    绘制完整K线图，每根K线都有编号（从K1开始）
+    max_bar: 显示的K线数量（例如80表示显示K1-K80）
+    """
+    # 取最近 max_bar 根K线
+    start = max(0, len(df) - max_bar)
+    plot_df = df.iloc[start:].copy().reset_index(drop=True)
+    # 实际显示的K线数量
+    n_bars = len(plot_df)
+    # 编号从1开始：K1, K2, K3...
+    bar_numbers = list(range(1, n_bars + 1))
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
@@ -164,11 +170,10 @@ def build_chart(df, max_bar):
         marker_color=vol_colors, showlegend=False, opacity=0.5
     ), row=2, col=1)
 
-    # ========== 关键修改：每根K线都标注编号 ==========
-    # 每根K线都标注，但字号小一些，颜色淡一些
-    for idx, orig_idx in enumerate(original_indices):
+    # ========== 每根K线都标注编号（从K1开始）==========
+    for idx, bar_num in enumerate(bar_numbers):
         row_data = plot_df.iloc[idx]
-        # 根据K线方向决定标注位置（阳线在下方，阴线在上方）
+        # 根据K线方向决定标注位置
         if row_data["close"] >= row_data["open"]:
             # 阳线：编号标在K线下方
             y_pos = row_data["low"]
@@ -180,26 +185,26 @@ def build_chart(df, max_bar):
         
         fig.add_annotation(
             x=idx, y=y_pos,
-            text=str(orig_idx),
+            text=f"K{bar_num}",
             showarrow=False,
-            font=dict(size=8, color="#666666"),
+            font=dict(size=7, color="#888888"),
             yshift=y_shift,
             row=1, col=1
         )
     
     # 每隔10根K线用更大的字体突出显示
-    for idx, orig_idx in enumerate(original_indices):
-        if orig_idx % 10 == 0 and orig_idx != 0:
+    for idx, bar_num in enumerate(bar_numbers):
+        if bar_num % 10 == 0:
             row_data = plot_df.iloc[idx]
             if row_data["close"] >= row_data["open"]:
                 y_pos = row_data["low"]
-                y_shift = -20
+                y_shift = -22
             else:
                 y_pos = row_data["high"]
-                y_shift = 20
+                y_shift = 22
             fig.add_annotation(
                 x=idx, y=y_pos,
-                text=f"★ {orig_idx}",
+                text=f"★ K{bar_num}",
                 showarrow=False,
                 font=dict(size=10, color="#333333", weight="bold"),
                 yshift=y_shift,
@@ -220,7 +225,7 @@ def build_chart(df, max_bar):
     # 添加说明文字
     fig.add_annotation(
         x=0.01, y=0.99, xref="paper", yref="paper",
-        text="📌 每根K线上方/下方都有编号（K0, K1, K2...）| ★标注每10根",
+        text="📌 每根K线都有编号（K1, K2, K3...）| ★标注每10根",
         showarrow=False,
         font=dict(size=10, color="#888888"),
         bgcolor="rgba(255,255,255,0.8)",
@@ -235,7 +240,7 @@ def init_state():
     defaults = {
         "df": None,
         "symbol": None,
-        "max_bar": 80,
+        "max_bar": 80,  # 显示的K线数量
         "conversations": [],
         "analysis_complete": False,
         "practice_count": 0,
@@ -258,11 +263,9 @@ def load_new_symbol(code, period_value):
             return False
         
         # 显示最近80根K线
-        max_bar = min(80, len(df) - 1)
-        
         st.session_state.df = df
         st.session_state.symbol = code
-        st.session_state.max_bar = max_bar
+        st.session_state.max_bar = 80
         reset_analysis()
         return True
 
@@ -299,7 +302,7 @@ def main():
         st.markdown("---")
         st.markdown("**训练理念**")
         st.caption("一次性加载80根K线，一次性完成五步分析")
-        st.caption("每根K线都有编号，分析时必须引用具体K线")
+        st.caption("每根K线都有编号（K1-K80），分析时必须引用具体K线")
         st.caption("AI追问证据和反证，训练完整的故事阅读能力")
         
         st.markdown("---")
@@ -325,6 +328,9 @@ def main():
             if st.button("🔄 重置当前分析", use_container_width=True):
                 reset_analysis()
                 st.rerun()
+            
+            total_bars = len(st.session_state.df)
+            st.caption(f"数据总K线: {total_bars}根 | 显示最新80根")
 
     # 主界面
     if st.session_state.df is None:
@@ -335,7 +341,7 @@ def main():
         <p><strong>一次性分析80根K线，输出完整故事。</strong></p>
         <p>训练流程：</p>
         <ol>
-            <li>加载80根K线图表（每根K线都有编号K0, K1, K2...）</li>
+            <li>加载80根K线图表（每根K线都有编号<strong>K1, K2, K3...K80</strong>）</li>
             <li>按照五步框架，一次性分析整张图，<strong>必须引用具体K线编号</strong></li>
             <li>AI会检查你是否引用了K线编号，并追问证据和反证</li>
             <li>完成分析后，系统记录一次完整复盘</li>
@@ -400,8 +406,10 @@ def main():
         
         conv.append({"role": "assistant", "content": ai_response})
         
-        # 简单判断：如果用户输入超过150字且包含"K"（引用了编号），视为完成
-        if len(user_input) > 150 and ("K" in user_input or "k" in user_input):
+        # 判断是否完成：输入超过150字且引用了K线编号
+        import re
+        has_k_line = bool(re.search(r'K\d+', user_input))
+        if len(user_input) > 150 and has_k_line:
             st.session_state.analysis_complete = True
         
         st.rerun()

@@ -1,12 +1,6 @@
 """
-Al Brooks 日内机会寻找训练器 V5.0（最终修正版）
+Al Brooks 日内机会寻找训练器 V5.0（稳定版）
 核心设计：一次性分析80根K线，输出完整故事
-
-设计理念：
-- 一次性加载80根K线
-- 用户按照五步框架，一次性分析完整图表
-- AI 追问证据和反证
-- 输出完整的故事时间轴
 """
 
 import streamlit as st
@@ -64,6 +58,7 @@ STORY_ANALYSIS_SYSTEM = """你是 Al Brooks 价格行为教练。
 - 先说肯定的话（"好的，我理解了"）
 - 然后问2-3个引导性问题
 - 控制在150字以内
+- 语气平和，像教练一样引导
 
 【图表信息】
 K线范围: K0 ~ K{max_bar}（共{count}根K线）
@@ -79,7 +74,7 @@ def call_story_analyzer(df, max_bar, user_story, conversation_history):
     model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
     
     if not api_key:
-        return "【提示】请配置API密钥"
+        return "【提示】请配置API密钥\n\n请在 Streamlit Cloud 后台设置 OPENAI_API_KEY"
     
     first_close = df.iloc[0]["close"]
     last_close = df.iloc[max_bar]["close"]
@@ -104,9 +99,10 @@ def call_story_analyzer(df, max_bar, user_story, conversation_history):
         {"role": "user", "content": f"用户的五步分析：\n{user_story}"}
     ]
     
-    # 添加历史对话
+    # 添加历史对话（确保格式正确）
     for msg in conversation_history[-6:]:
-        messages.append(msg)
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            messages.append(msg)
     
     try:
         client = OpenAI(base_url=base_url, api_key=api_key)
@@ -115,7 +111,7 @@ def call_story_analyzer(df, max_bar, user_story, conversation_history):
         )
         return resp.choices[0].message.content
     except Exception as e:
-        return f"AI错误: {e}"
+        return f"AI错误: {str(e)[:100]}\n\n请检查API配置。"
 
 
 # ==================== 数据加载 ====================
@@ -163,7 +159,7 @@ def build_chart(df, max_bar):
         marker_color=vol_colors, showlegend=False, opacity=0.5
     ), row=2, col=1)
 
-    # 标记K线编号
+    # 标记K线编号（每10根标一个）
     for idx, orig_idx in enumerate(original_indices):
         if orig_idx % 10 == 0:
             row_data = plot_df.iloc[idx]
@@ -193,7 +189,7 @@ def init_state():
         "df": None,
         "symbol": None,
         "max_bar": 80,
-        "conversations": [],
+        "conversations": [],  # 存储 {"role": "user"/"assistant", "content": "..."}
         "analysis_complete": False,
         "practice_count": 0,
     }
@@ -214,9 +210,12 @@ def load_new_symbol(code, period_value):
             st.error(f"{code} 数据加载失败")
             return False
         
+        # 设置最大K线索引（显示最近80根，但确保不超过数据长度）
+        max_bar = min(80, len(df) - 1)
+        
         st.session_state.df = df
         st.session_state.symbol = code
-        st.session_state.max_bar = min(80, len(df) - 1)
+        st.session_state.max_bar = max_bar
         reset_analysis()
         return True
 
@@ -311,36 +310,50 @@ def main():
             st.caption(step['question'])
             st.markdown("---")
 
-    # 对话区域
+    # 对话区域（安全显示）
     conv = st.session_state.conversations
     
+    # 确保 conv 中的每条消息都有正确的格式
     for msg in conv:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     # 分析完成
     if st.session_state.analysis_complete:
         st.success("🎉 完成一次完整复盘！")
         
-        if st.button("🔄 开始下一次复盘", type="primary"):
-            st.session_state.practice_count += 1
-            reset_analysis()
-            st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 开始下一次复盘", type="primary"):
+                st.session_state.practice_count += 1
+                reset_analysis()
+                st.rerun()
+        with col2:
+            if st.button("🎲 换一个品种"):
+                all_codes = []
+                for codes in EXCHANGES.values():
+                    all_codes.extend(codes)
+                new_code = random.choice(all_codes)
+                load_new_symbol(new_code, "30")
+                st.rerun()
         return
 
     # 等待用户输入
     user_input = st.chat_input("请按照五步框架，描述你对这张图的分析...")
 
     if user_input:
+        # 添加用户消息
         conv.append({"role": "user", "content": user_input})
         
         with st.spinner("AI分析中..."):
             ai_response = call_story_analyzer(df, max_bar, user_input, conv)
         
+        # 添加AI回复
         conv.append({"role": "assistant", "content": ai_response})
         
-        # 简单判断：如果用户输入超过200字，视为完成分析
-        if len(user_input) > 200:
+        # 简单判断：如果用户输入超过150字，视为完成分析
+        if len(user_input) > 150:
             st.session_state.analysis_complete = True
         
         st.rerun()

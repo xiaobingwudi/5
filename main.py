@@ -246,46 +246,56 @@ def build_previous_findings(step_summaries):
     return "\n".join(f"第{k}步发现：{v}" for k, v in step_summaries.items())
 
 
-# ==================== AI 调用 ====================
-def get_ai_client():
+# ==================== AI 调用函数（适配您的配置）====================
+def _gpt(messages):
+    """调用 DeepSeek API（适配您的 Streamlit Cloud 配置）"""
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
     model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
-    return OpenAI(base_url=base_url, api_key=api_key), model
-
-
-def call_coach(step_num, conversation_history, step_summaries, reading_profile):
-    client, model = get_ai_client()
-    system = COACH_SYSTEM.format(
-        step_info=build_step_info(step_num),
-        profile_text=build_profile_text(reading_profile),
-        previous_findings=build_previous_findings(step_summaries),
-    )
-    messages = [{"role": "system", "content": system}] + conversation_history
+    if not api_key:
+        st.error("API 密钥未配置！请在 Streamlit Cloud 后台设置 OPENAI_API_KEY")
+        return "【配置提示】请先配置 DeepSeek API 密钥后再开始训练。"
     try:
+        client = OpenAI(base_url=base_url, api_key=api_key)
         resp = client.chat.completions.create(
-            model=model, messages=messages, temperature=0.3, max_tokens=400
+            model=model, messages=messages, temperature=0.2, max_tokens=700
         )
         return resp.choices[0].message.content
     except Exception as e:
-        return f"API错误: {e}\n[CONTINUE]"
+        st.error(f"API 调用失败: {e}")
+        return f"【API 错误】{e}"
+
+
+def call_coach(step_num, conversation_history, structure_report, detected_elements, 
+               step_summaries, reading_profile, round_num, max_rounds):
+    """调用教练 API"""
+    system_prompt = COACH_SYSTEM.format(
+        structure_report=structure_report,
+        detected_elements="、".join(detected_elements) if detected_elements else "无明显形态",
+        step_info=build_step_info(step_num),
+        profile_text=build_profile_guidance(reading_profile),
+        previous_findings=build_previous_findings(step_summaries),
+    )
+    messages = [{"role": "system", "content": system_prompt}] + conversation_history
+    
+    response = _gpt(messages)
+    
+    # 确保返回格式包含标记
+    if "[NEXT]" not in response and "[CONTINUE]" not in response:
+        if round_num >= max_rounds:
+            return response + "\n[NEXT]"
+        return response + "\n[CONTINUE]"
+    return response
 
 
 def summarize_step(step_num, user_answers_text):
-    client, model = get_ai_client()
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "用30字以内总结用户在本步骤的关键发现，只输出发现内容。"},
-                {"role": "user", "content": user_answers_text}
-            ],
-            temperature=0.0,
-            max_tokens=100,
-        )
-        return resp.choices[0].message.content.strip()
-    except:
-        return user_answers_text[:100]
+    """生成本步骤摘要"""
+    system = "用30字以内总结用户在本步骤的关键发现，只输出发现内容，不要评价。"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_answers_text}
+    ]
+    return _gpt(messages)
 
 
 # ==================== 数据加载 ====================

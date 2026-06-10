@@ -507,24 +507,43 @@ def build_previous_findings(step_summaries):
     return "\n".join(f"第{k}步：{v}" for k, v in step_summaries.items())
 
 
-# ==================== AI 调用函数（适配您的配置）====================
+
+# ==================== AI 调用函数（完全修复版）====================
 def _gpt(messages):
     """调用 DeepSeek API（适配 Streamlit Cloud 配置）"""
-    api_key = st.secrets.get("OPENAI_API_KEY", "")
-    base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
-    model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
+    # 方案1：使用 st.secrets（推荐）
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+        base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
+        model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
+    except Exception:
+        # 方案2：使用环境变量（备选）
+        import os
+        api_key = os.environ.get("OPENAI_API_KEY")
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com")
+        model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
+    
     if not api_key:
-        st.error("API 密钥未配置！请在 Streamlit Cloud 后台设置 OPENAI_API_KEY")
-        return "【配置提示】请先配置 DeepSeek API 密钥后再开始训练。"
+        error_msg = "【配置提示】API密钥未配置。\n\n"
+        error_msg += "请在 Streamlit Cloud 后台设置：\n"
+        error_msg += "Settings → Secrets → 添加 OPENAI_API_KEY\n\n"
+        error_msg += "或者联系管理员配置。"
+        st.error(error_msg)
+        return error_msg + "\n[CONTINUE]"
+    
     try:
         client = OpenAI(base_url=base_url, api_key=api_key)
         resp = client.chat.completions.create(
-            model=model, messages=messages, temperature=0.2, max_tokens=700
+            model=model, 
+            messages=messages, 
+            temperature=0.2, 
+            max_tokens=700
         )
         return resp.choices[0].message.content
     except Exception as e:
-        st.error(f"API 调用失败: {e}")
-        return f"【API 错误】{e}"
+        error_msg = f"【API错误】{str(e)}"
+        st.error(error_msg)
+        return error_msg + "\n[CONTINUE]"
 
 
 def call_coach(step_num, conversation_history, structure_report, detected_elements, 

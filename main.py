@@ -1,11 +1,15 @@
 """
-Al Brooks 日内机会寻找训练器 V4.1
-视觉优化版
+Al Brooks 日内机会寻找训练器 V4.3
+核心增强：AI 先独立分析图表结构，再批改用户观察
 
-优化内容：
-1. 侧边栏改为更舒适的配色（深蓝灰背景 + 高对比文字）
-2. 整体界面更柔和，减少视觉疲劳
-3. 调整字体颜色和对比度
+新增分析能力：
+1. 通道识别（上升/下降/水平通道）
+2. 楔形检测（3个以上同向接触点）
+3. 超出(Overshoot)检测
+4. 双顶/双底增强
+5. 收缩/扩展三角形检测
+6. 推进波识别（一推、二推、三推）
+7. 完整度计算基于实际存在的形态（而非固定清单）
 """
 
 import streamlit as st
@@ -17,6 +21,9 @@ import akshare as ak
 from openai import OpenAI
 import random
 import time
+import re
+from collections import deque
+from sklearn.linear_model import LinearRegression
 
 # ==================== 配置 ====================
 SYMBOL_NAMES = {
@@ -39,7 +46,8 @@ EXCHANGES = {
     "能源": ["SC", "FU"],
 }
 
-MAX_ROUNDS_PER_STEP = 2
+MIN_ROUNDS = 1
+MAX_ROUNDS = 3
 
 # ==================== 5步流程定义 ====================
 STEPS = {
@@ -48,13 +56,13 @@ STEPS = {
         "title": "寻找通道、楔形和超出(Overshoot)",
         "question": "你会如何画线？请说明你的选择和理由。",
         "core_elements": [
-            "主趋势线（连接主要高点或低点）",
-            "平行通道线（与主趋势线平行的支撑/阻力线）",
-            "超出(Overshoot)：是否有K线突破了你画的线？",
-            "备选画法：是否存在其他合理的画线方式？",
-            "最终选择：你选择哪条线？为什么？"
+            "通道方向（上升/下降/水平）",
+            "通道边界（至少2个高点+2个低点）",
+            "楔形（3个以上同向接触点）",
+            "超出(Overshoot)：K线突破通道边界",
+            "备选画法和最终选择"
         ],
-        "example_good": "我用K5、K15、K25的高点画了一条下降趋势线。K8、K18的低点构成了平行支撑线，形成一个下降通道。K18的低点向下刺穿了支撑线形成Overshoot，但很快收回。我也考虑过连接K5和K25，但K15的超出更明显，所以我选择了更陡峭的那条。",
+        "example_good": "我用K5、K15、K25的高点画了一条下降趋势线。K8、K18的低点构成了平行支撑线，形成一个下降通道。K18的低点向下刺穿了支撑线形成Overshoot，但很快收回。",
         "example_bad": "这是一个下降通道。",
     },
     2: {
@@ -62,147 +70,387 @@ STEPS = {
         "title": "识别双顶/双底、三角形等反转形态",
         "question": "图表上出现了哪些反转或延续形态？",
         "core_elements": [
-            "双顶或双底（等高、更高/更低高点、更高/更低低点）",
-            "微型双顶/双底（2-4根K线内形成）",
-            "楔形（上升/下降，通常包含在通道内）",
-            "三角形（收缩型/扩展型）",
-            "主趋势反转(MTR)：突破重要趋势线",
-            "失败突破（假突破）",
+            "双顶或双底",
+            "收缩三角形（低点抬高+高点降低）",
+            "扩展三角形（低点降低+高点抬高）",
+            "一推、二推、三推",
+            "失败突破"
         ],
-        "example_good": "K12和K28构成一个更高低点的双底，右底更强。K15-K20之间有一个收缩三角形，低点K17比K15高，高点K19比K16低。K22向上突破失败，形成假突破，立刻被空头打压。",
-        "example_bad": "这里有双底，所以一定会上涨。这里有楔形，所以马上反转。这里突破了，所以必须追。",
+        "example_good": "K12和K28构成更高低点的双底。K15-K20之间是收缩三角形。K22向上假突破后回落。",
+        "example_bad": "有双底，要涨了。",
     },
     3: {
         "name": "第3步：特殊K线",
-        "title": "识别信号K线 (IB, OB, IOI, 大K线, 连续强势K线)",
+        "title": "识别信号K线",
         "question": "有哪些特殊的单根K线或K线组合？",
         "core_elements": [
-            "大K线（实体占波幅>80%），以及它的收盘位置",
-            "内包K线(IB)",
-            "外包K线(OB)",
-            "IOI模式（外包->内包->外包）",
-            "连续内包线或连续外包线",
-            "连续同向强势K线（3根以上，且重叠很少）",
-            "高位收盘/低位收盘",
+            "大K线（实体>80%）",
+            "惊讶K线（波幅>近期平均1.5倍）",
+            "内包线(IB)",
+            "外包线(OB)",
+            "IOI模式",
+            "连续强势K线"
         ],
-        "example_good": "K15是大阳线，实体92%，高位收盘，表明买方强劲。K16是内包线。K17是外包线，包含K16，形成IOI模式，预示着即将突破。K33-K35是三根连续的多头K线，几乎没有重叠，说明市场持续强劲买入。",
-        "example_bad": "K15是大K线，很强势。",
+        "example_good": "K15是大阳线，实体92%，高位收盘。K16是内包线。K17是外包线，形成IOI。K22是惊讶K线，波幅是平均的2倍。",
+        "example_bad": "K15是大K线。",
     },
     4: {
         "name": "第4步：值得做吗",
-        "title": "评估风险回报，决定是否入场",
+        "title": "评估概率、空间和风险",
         "question": "这笔交易值得做吗？",
         "core_elements": [
-            "止损位置：具体价格（通常设在信号K线高/低点外侧）",
-            "风险距离：从入场价到止损的距离",
-            "第一目标位置（至少是风险的2倍以上）",
-            "风险回报比(R:R)至少要达到2:1",
-            "如果不值得，放弃；如果值得，怎么进场？"
+            "方向（多头/空头）",
+            "成功概率（高/中/低）",
+            "空间至少2R",
+            "失败代价",
+            "是否值得"
         ],
-        "example_good": "做多止损设在K28低点下方1 tick（3540），入场价约3560，风险20点。第一目标3600（2R），风险回报比2:1，值得做。采用突破单入场，在K28高点+1 tick。",
-        "example_bad": "在K28做多，感觉要涨。",
+        "example_good": "空头机会。双顶+下降通道，概率高。风险20点，目标40点以上。值得做。",
+        "example_bad": "感觉要涨。",
     },
     5: {
         "name": "第5步：管理仓位",
         "title": "持仓期间的管理计划",
-        "question": "入场后如何管理这笔交易？",
+        "question": "入场后如何管理？",
         "core_elements": [
-            "仓位规模：根据风险决定（通常每笔风险1-2%）",
-            "实现概率：这笔交易成功的概率有多高？(高/中/低)",
-            "提前退出条件：什么情况下会提前离场？",
-            "移动止损：什么情况下移动止损到保本？",
-            "分批止盈计划"
+            "仓位规模",
+            "提前退出条件",
+            "移动止损",
+            "分批止盈"
         ],
-        "example_good": "仓位规模为总资金的2%。成功概率高，因为它结合了形态、K线和通道的多重信号。若入场后价格在K28收盘价下方持续3根K线，则提前离场。涨到3600后移动止损到入场价保本。",
-        "example_bad": "拿着等涨就行。",
+        "example_good": "2%仓位。若3根K线反向则离场。涨到1R后移动止损保本。",
+        "example_bad": "拿着等涨。",
     },
 }
 
-# ==================== 结构分析函数（后台使用，用户不可见）====================
-def find_swing_points_in_range(df, start_idx, end_idx, pivot_window=2):
-    sub = df.iloc[start_idx:end_idx + 1].copy().reset_index(drop=True)
-    n = len(sub)
-    w = pivot_window
-    swing_highs = []
-    swing_lows = []
+# ==================== 增强的结构分析类 ====================
+class StructureAnalyzer:
+    """独立分析图表结构，不依赖AI视觉"""
     
-    if n < w * 2 + 1:
-        return swing_highs, swing_lows
+    def __init__(self, df, bar, lookback=80):
+        self.df = df
+        self.bar = bar
+        self.start = max(0, bar - lookback)
+        self.sub = df.iloc[self.start:bar+1].copy().reset_index(drop=True)
+        self.original_indices = list(range(self.start, bar+1))
+        self.swing_highs = []
+        self.swing_lows = []
+        self._find_swing_points()
     
-    for i in range(w, n - w):
-        h = sub.iloc[i]["high"]
-        l = sub.iloc[i]["low"]
-        orig_idx = start_idx + i
+    def _find_swing_points(self, pivot_window=2):
+        """识别摆动高低点"""
+        n = len(self.sub)
+        w = pivot_window
+        for i in range(w, n - w):
+            h = self.sub.iloc[i]["high"]
+            l = self.sub.iloc[i]["low"]
+            orig_idx = self.original_indices[i]
+            
+            left_higher = all(self.sub.iloc[i - j]["high"] < h for j in range(1, w+1))
+            right_higher = all(self.sub.iloc[i + j]["high"] < h for j in range(1, w+1))
+            if left_higher and right_higher:
+                self.swing_highs.append({"idx": orig_idx, "price": h})
+            
+            left_lower = all(self.sub.iloc[i - j]["low"] > l for j in range(1, w+1))
+            right_lower = all(self.sub.iloc[i + j]["low"] > l for j in range(1, w+1))
+            if left_lower and right_lower:
+                self.swing_lows.append({"idx": orig_idx, "price": l})
+    
+    def detect_channel(self):
+        """检测通道方向"""
+        if len(self.swing_highs) < 2 or len(self.swing_lows) < 2:
+            return "数据不足"
         
-        left_higher = all(sub.iloc[i - j]["high"] < h for j in range(1, w + 1))
-        right_higher = all(sub.iloc[i + j]["high"] < h for j in range(1, w + 1))
-        if left_higher and right_higher:
-            swing_highs.append({"idx": orig_idx, "price": h})
+        highs = self.swing_highs[-3:]
+        lows = self.swing_lows[-3:]
         
-        left_lower = all(sub.iloc[i - j]["low"] > l for j in range(1, w + 1))
-        right_lower = all(sub.iloc[i + j]["low"] > l for j in range(1, w + 1))
-        if left_lower and right_lower:
-            swing_lows.append({"idx": orig_idx, "price": l})
+        if len(highs) >= 2:
+            high_slope = (highs[-1]["price"] - highs[-2]["price"]) / (highs[-1]["idx"] - highs[-2]["idx"]) if highs[-1]["idx"] != highs[-2]["idx"] else 0
+        else:
+            high_slope = 0
+        
+        if len(lows) >= 2:
+            low_slope = (lows[-1]["price"] - lows[-2]["price"]) / (lows[-1]["idx"] - lows[-2]["idx"]) if lows[-1]["idx"] != lows[-2]["idx"] else 0
+        else:
+            low_slope = 0
+        
+        avg_slope = (high_slope + low_slope) / 2
+        
+        if avg_slope > 0.1:
+            return "上升通道"
+        elif avg_slope < -0.1:
+            return "下降通道"
+        else:
+            return "水平通道（震荡）"
     
-    return swing_highs, swing_lows
-
-
-def detect_bar_patterns_in_range(df, start_idx, end_idx, lookback=50):
-    actual_start = max(start_idx, end_idx - lookback)
-    sub = df.iloc[actual_start:end_idx + 1].copy().reset_index(drop=True)
-    n = len(sub)
-    patterns = []
-
-    for i in range(1, n):
-        prev = sub.iloc[i - 1]
-        curr = sub.iloc[i]
-        orig_idx = actual_start + i
-        ph, pl = prev["high"], prev["low"]
-        ch, cl = curr["high"], curr["low"]
-        co, cc = curr["open"], curr["close"]
-        body = abs(cc - co)
-        total = ch - cl
-        body_ratio = body / total if total > 0 else 0
-
-        if ch < ph and cl > pl:
-            patterns.append(f"K{orig_idx}: 内包线")
-        elif ch > ph and cl < pl:
-            patterns.append(f"K{orig_idx}: 外包线")
-
-        if body_ratio > 0.80:
-            direction = "阳线" if cc > co else "阴线"
-            patterns.append(f"K{orig_idx}: 大{direction}({body_ratio*100:.0f}%实体)")
-
-    return patterns[-15:]
+    def detect_wedge(self):
+        """检测楔形（3个以上同向接触点）"""
+        if len(self.swing_highs) >= 3:
+            x_highs = [[h["idx"]] for h in self.swing_highs[-3:]]
+            y_highs = [h["price"] for h in self.swing_highs[-3:]]
+            if len(x_highs) >= 2:
+                try:
+                    reg = LinearRegression().fit(x_highs, y_highs)
+                    r2_high = reg.score(x_highs, y_highs)
+                except:
+                    r2_high = 0
+            else:
+                r2_high = 0
+        else:
+            r2_high = 0
+        
+        if len(self.swing_lows) >= 3:
+            x_lows = [[l["idx"]] for l in self.swing_lows[-3:]]
+            y_lows = [l["price"] for l in self.swing_lows[-3:]]
+            if len(x_lows) >= 2:
+                try:
+                    reg = LinearRegression().fit(x_lows, y_lows)
+                    r2_low = reg.score(x_lows, y_lows)
+                except:
+                    r2_low = 0
+            else:
+                r2_low = 0
+        else:
+            r2_low = 0
+        
+        wedge_detected = (r2_high > 0.9 and len(self.swing_highs) >= 3) or (r2_low > 0.9 and len(self.swing_lows) >= 3)
+        return wedge_detected
+    
+    def detect_double_top_bottom(self):
+        """检测双顶/双底"""
+        results = []
+        if len(self.swing_highs) >= 2:
+            h1, h2 = self.swing_highs[-2], self.swing_highs[-1]
+            diff_pct = abs(h2["price"] - h1["price"]) / h1["price"] if h1["price"] > 0 else 1
+            if diff_pct < 0.02:
+                if h2["price"] > h1["price"]:
+                    results.append(f"更高高点双顶")
+                else:
+                    results.append(f"双顶")
+        
+        if len(self.swing_lows) >= 2:
+            l1, l2 = self.swing_lows[-2], self.swing_lows[-1]
+            diff_pct = abs(l2["price"] - l1["price"]) / l1["price"] if l1["price"] > 0 else 1
+            if diff_pct < 0.02:
+                if l2["price"] > l1["price"]:
+                    results.append(f"更高低点双底")
+                else:
+                    results.append(f"双底")
+        
+        return results
+    
+    def detect_triangle(self):
+        """检测三角形（收缩/扩展）"""
+        if len(self.swing_highs) < 2 or len(self.swing_lows) < 2:
+            return None
+        
+        high_diff = self.swing_highs[-1]["price"] - self.swing_highs[-2]["price"]
+        low_diff = self.swing_lows[-1]["price"] - self.swing_lows[-2]["price"]
+        
+        if high_diff < 0 and low_diff > 0:
+            return "收缩三角形（低点抬高，高点降低）"
+        elif high_diff > 0 and low_diff < 0:
+            return "扩展三角形（低点降低，高点抬高）"
+        return None
+    
+    def detect_pushes(self):
+        """检测推进波（一推、二推、三推）"""
+        pushes = []
+        prices = []
+        
+        for sh in self.swing_highs[-5:]:
+            prices.append(("H", sh["price"], sh["idx"]))
+        for sl in self.swing_lows[-5:]:
+            prices.append(("L", sl["price"], sl["idx"]))
+        
+        prices.sort(key=lambda x: x[2])
+        
+        if len(prices) >= 4:
+            push_count = 1
+            for i in range(1, len(prices)):
+                if prices[i][1] > prices[i-1][1] and prices[i][0] == "H":
+                    push_count += 1
+                elif prices[i][1] < prices[i-1][1] and prices[i][0] == "L":
+                    push_count += 1
+                else:
+                    if push_count >= 2:
+                        pushes.append(f"{push_count}推")
+                    push_count = 1
+            
+            if push_count >= 2:
+                pushes.append(f"{push_count}推")
+        
+        return pushes
+    
+    def detect_special_bars(self):
+        """检测特殊K线"""
+        patterns = []
+        ranges = []
+        
+        for i in range(max(0, len(self.sub)-20), len(self.sub)):
+            row = self.sub.iloc[i]
+            ranges.append(row["high"] - row["low"])
+        avg_range = sum(ranges) / len(ranges) if ranges else 0
+        
+        for i in range(1, len(self.sub)):
+            prev = self.sub.iloc[i-1]
+            curr = self.sub.iloc[i]
+            orig_idx = self.original_indices[i]
+            co, cc = curr["open"], curr["close"]
+            body = abs(cc - co)
+            total = curr["high"] - curr["low"]
+            body_ratio = body / total if total > 0 else 0
+            
+            if body_ratio > 0.80:
+                direction = "阳线" if cc > co else "阴线"
+                patterns.append({"type": "大K线", "idx": orig_idx, "detail": f"{direction}({body_ratio*100:.0f}%)"})
+            
+            if total > avg_range * 1.5 and avg_range > 0:
+                patterns.append({"type": "惊讶K线", "idx": orig_idx, "detail": f"波幅{total:.0f}，平均{avg_range:.0f}"})
+            
+            if curr["high"] < prev["high"] and curr["low"] > prev["low"]:
+                patterns.append({"type": "IB", "idx": orig_idx})
+            
+            elif curr["high"] > prev["high"] and curr["low"] < prev["low"]:
+                patterns.append({"type": "OB", "idx": orig_idx})
+            
+            if cc > co:
+                if cc > curr["high"] - total * 0.2:
+                    patterns.append({"type": "高位收盘", "idx": orig_idx})
+            else:
+                if cc < curr["low"] + total * 0.2:
+                    patterns.append({"type": "低位收盘", "idx": orig_idx})
+        
+        for i in range(2, len(self.sub)):
+            k1 = self.sub.iloc[i-2]
+            k2 = self.sub.iloc[i-1]
+            k3 = self.sub.iloc[i]
+            if (k2["high"] < k1["high"] and k2["low"] > k1["low"]) and \
+               (k3["high"] > k2["high"] and k3["low"] < k2["low"]):
+                patterns.append({"type": "IOI", "idx": self.original_indices[i]})
+        
+        streak = 1
+        for i in range(len(self.sub)-2, -1, -1):
+            curr = self.sub.iloc[i]
+            next_bar = self.sub.iloc[i+1]
+            if (curr["close"] >= curr["open"]) == (next_bar["close"] >= next_bar["open"]):
+                overlap = min(curr["high"], next_bar["high"]) - max(curr["low"], next_bar["low"])
+                if overlap <= 0:
+                    streak += 1
+                else:
+                    break
+            else:
+                break
+        if streak >= 3:
+            patterns.append({"type": "连续强势K线", "idx": self.original_indices[-1], "detail": f"{streak}根"})
+        
+        return patterns
+    
+    def generate_full_report(self):
+        """生成完整的结构分析报告（AI独立分析结果）"""
+        channel = self.detect_channel()
+        wedge = self.detect_wedge()
+        double_patterns = self.detect_double_top_bottom()
+        triangle = self.detect_triangle()
+        pushes = self.detect_pushes()
+        special_bars = self.detect_special_bars()
+        
+        detected_elements = []
+        
+        report_lines = [
+            "═══════ AI独立分析结果 ═══════",
+            f"分析范围: K{self.start} ~ K{self.bar}（共{len(self.sub)}根K线）",
+            "",
+            "【第1步：通道和楔形】",
+            f"  通道: {channel}",
+        ]
+        if wedge:
+            report_lines.append("  楔形: ✓ 检测到")
+            detected_elements.append("楔形")
+        else:
+            report_lines.append("  楔形: ✗ 未检测到")
+        
+        report_lines.append("")
+        report_lines.append("【第2步：形态】")
+        if double_patterns:
+            report_lines.append(f"  双顶/双底: {', '.join(double_patterns)}")
+            detected_elements.extend(double_patterns)
+        else:
+            report_lines.append("  双顶/双底: 未检测到")
+        
+        if triangle:
+            report_lines.append(f"  三角形: {triangle}")
+            detected_elements.append("三角形")
+        else:
+            report_lines.append("  三角形: 未检测到")
+        
+        if pushes:
+            report_lines.append(f"  推进波: {', '.join(pushes)}")
+            detected_elements.extend(pushes)
+        else:
+            report_lines.append("  推进波: 未检测到")
+        
+        report_lines.append("")
+        report_lines.append("【第3步：特殊K线】")
+        
+        bar_types = {}
+        for bar in special_bars:
+            t = bar["type"]
+            if t not in bar_types:
+                bar_types[t] = []
+            bar_types[t].append(bar["idx"])
+        
+        for t, indices in bar_types.items():
+            idx_str = f"K{','.join(map(str, indices[:3]))}" + ("..." if len(indices) > 3 else "")
+            report_lines.append(f"  {t}: {idx_str}")
+            if t not in ["高位收盘", "低位收盘"]:
+                detected_elements.append(t)
+        
+        report_lines.append("")
+        report_lines.append("【第4步：值得做吗】")
+        if double_patterns or wedge or triangle or pushes:
+            report_lines.append("  潜在机会: 存在多重信号")
+        else:
+            report_lines.append("  潜在机会: 信号不明显")
+        
+        report_lines.append("")
+        report_lines.append("【第5步：管理参考】")
+        report_lines.append("  止损: 通常设在信号K线高低点外侧")
+        report_lines.append("  目标: 至少2R")
+        
+        return "\n".join(report_lines), detected_elements
 
 
 # ==================== AI 提示词 ====================
 COACH_SYSTEM = """你是 Al Brooks 价格行为分析教练。
 
-【你的角色】
-- 你正在训练一个交易员养成"每天按固定流程复盘"的习惯。
-- 你不是考官，你是陪练。
-- 目标不是让用户"答对"，而是帮他"逐步形成自己的观察框架"。
+【核心原则】
+- 你已经独立完成了图表的结构分析（见下方的【AI独立分析结果】）
+- 你的任务是：基于你自己的分析结果，批改用户的观察
+- 你不是在猜市场，你是有依据的
 
-【如何引导】
-- 优先观察用户是否遗漏了当前步骤最核心的几个要素。
-- 鼓励他引用具体K线编号、价格、形态。
+【批改规则】
+1. 用户遗漏了实际存在的形态 → 追问
+2. 用户说了实际不存在的形态 → 友善指出，不过度纠正
+3. 用户判断与你的分析不一致但逻辑合理 → 认可灵活性
 
-【画线灵活性原则 - 极其重要】
-- 双顶/双底很少完美，不要求精准。
-- 通道画法可以有多种，关键是能否解释得通。
-- **如果用户的画线方式与你参考的结构不同：只要逻辑成立，绝对不要纠正成后台画法。**
-- 优先询问："为什么你更喜欢这种画法？" 而不是 "正确画法是什么？"
+【反证原则】
+- 如果用户给出判断，追问："什么情况会证明你是错的？"
 
-【禁止预测 - 极其重要】
-- 发现形态 ≠ 预测结果。
-- 如果用户把形态直接等同于结果（如"双底所以一定涨"），请提醒：
-  "这个形态说明了什么？而不是一定会发生什么？"
+【画线灵活性】
+- 通道画法可以有多种合理方式
+- 如果用户画法与你的分析不同但逻辑成立，不要纠正
 
-【输出要求】
-- 反馈请控制在120字以内。
-- 每轮对话后，如果用户已经覆盖了核心要素，输出"[NEXT]"标记
-- 如果还需要补充，输出"[CONTINUE]"标记
+【输出格式】
+- 反馈控制在120字以内
+- 如果用户已覆盖主要形态，输出"[NEXT]"
+- 否则输出"[CONTINUE]"
+
+【AI独立分析结果】（这是你自己的分析，已包含第1-5步的结论）
+{structure_report}
+
+【实际存在的形态】（用于检查用户是否遗漏）
+{detected_elements}
 
 【当前训练步骤】
 {step_info}
@@ -229,26 +477,26 @@ def build_step_info(step_num):
     return "\n".join(lines)
 
 
-def build_profile_text(reading_profile):
+def build_profile_guidance(reading_profile):
     if not reading_profile:
         return "暂无"
     items = []
     for step_key, weaknesses in reading_profile.items():
         for w, count in weaknesses.items():
             if count >= 2:
-                items.append(f"第{step_key}步常漏：{w}")
+                items.append(f"第{step_key}步用户常漏：{w}")
     return "\n".join(items) if items else "无明显薄弱点"
 
 
 def build_previous_findings(step_summaries):
     if not step_summaries:
-        return "这是第1步，无前置发现。"
-    return "\n".join(f"第{k}步发现：{v}" for k, v in step_summaries.items())
+        return "这是第1步"
+    return "\n".join(f"第{k}步：{v}" for k, v in step_summaries.items())
 
 
 # ==================== AI 调用函数（适配您的配置）====================
 def _gpt(messages):
-    """调用 DeepSeek API（适配您的 Streamlit Cloud 配置）"""
+    """调用 DeepSeek API（适配 Streamlit Cloud 配置）"""
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
     model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
@@ -280,7 +528,6 @@ def call_coach(step_num, conversation_history, structure_report, detected_elemen
     
     response = _gpt(messages)
     
-    # 确保返回格式包含标记
     if "[NEXT]" not in response and "[CONTINUE]" not in response:
         if round_num >= max_rounds:
             return response + "\n[NEXT]"
@@ -298,6 +545,37 @@ def summarize_step(step_num, user_answers_text):
     return _gpt(messages)
 
 
+def calculate_coverage(user_answer, detected_elements):
+    """基于实际存在的形态计算完整度"""
+    if not detected_elements:
+        return 0, 0, 1.0
+    
+    user_lower = user_answer.lower()
+    covered = 0
+    
+    keyword_map = {
+        "楔形": ["楔形", "wedge"],
+        "双顶": ["双顶", "double top"],
+        "双底": ["双底", "double bottom"],
+        "三角形": ["三角形", "triangle"],
+        "推进波": ["推", "push"],
+        "大K线": ["大阳", "大阴", "大k"],
+        "惊讶K线": ["惊讶", "surprise"],
+        "IB": ["内包", "ib"],
+        "OB": ["外包", "ob"],
+        "IOI": ["ioi"],
+        "连续强势K线": ["连续", "强势", "无重叠"],
+    }
+    
+    for element in detected_elements:
+        keywords = keyword_map.get(element, [element.lower()])
+        if any(kw in user_lower for kw in keywords):
+            covered += 1
+    
+    ratio = covered / len(detected_elements) if detected_elements else 1.0
+    return covered, len(detected_elements), ratio
+
+
 # ==================== 数据加载 ====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(symbol, period="30"):
@@ -310,7 +588,8 @@ def load_data(symbol, period="30"):
             "low": "low", "close": "close", "volume": "volume"
         })
         return df.reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        st.error(f"数据加载失败: {e}")
         return None
 
 
@@ -383,6 +662,8 @@ def init_state():
         "current_bar": 80,
         "df": None,
         "symbol": None,
+        "structure_report": None,
+        "detected_elements": [],
         "conversations": {i: [] for i in range(1, 6)},
         "user_answers": {i: "" for i in range(1, 6)},
         "step_completed": {i: False for i in range(1, 6)},
@@ -391,6 +672,7 @@ def init_state():
         "round_count": {i: 0 for i in range(1, 6)},
         "total_practices": 0,
         "step_times": {i: [] for i in range(1, 6)},
+        "step_coverage": {i: [] for i in range(1, 6)},
         "current_step_start_time": None,
         "practice_start_time": None,
     }
@@ -416,9 +698,15 @@ def load_new_symbol(code, period_value):
             st.error(f"{code} 数据加载失败")
             return False
         bar = random.randint(80, len(df) - 20)
+        
+        analyzer = StructureAnalyzer(df, bar, lookback=80)
+        structure_report, detected_elements = analyzer.generate_full_report()
+        
         st.session_state.df = df
         st.session_state.symbol = code
         st.session_state.current_bar = bar
+        st.session_state.structure_report = structure_report
+        st.session_state.detected_elements = detected_elements
         reset_step_progress()
         st.session_state.practice_start_time = time.time()
         st.session_state.current_step_start_time = time.time()
@@ -430,6 +718,13 @@ def get_step_avg_time(step_num):
     if not times:
         return None
     return sum(times) / len(times)
+
+
+def get_step_avg_coverage(step_num):
+    coverages = st.session_state.step_coverage[step_num]
+    if not coverages:
+        return None
+    return sum(coverages) / len(coverages) * 100
 
 
 def get_step_trend(step_num):
@@ -447,122 +742,24 @@ def get_step_trend(step_num):
 
 # ==================== 主界面 ====================
 def main():
-    # 页面配置
     st.set_page_config(page_title="Al Brooks 5步训练器", layout="wide")
     
-    # 自定义CSS - 柔和配色
     st.markdown("""
     <style>
-    /* 主背景 */
-    .stApp {
-        background-color: #f5f7fa;
-    }
-    
-    /* 侧边栏 - 柔和深色 */
-    [data-testid="stSidebar"] {
-        background-color: #1e293b;
-    }
-    
-    [data-testid="stSidebar"] .stMarkdown,
-    [data-testid="stSidebar"] .stMarkdown p,
-    [data-testid="stSidebar"] .stMetric label,
-    [data-testid="stSidebar"] .stMetric value {
+    .stApp { background-color: #f5f7fa; }
+    [data-testid="stSidebar"] { background-color: #1e293b; }
+    [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] .stMarkdown p {
         color: #e2e8f0 !important;
     }
-    
-    [data-testid="stSidebar"] .stMetric {
-        background-color: #334155;
-        border-radius: 8px;
-        padding: 8px;
-    }
-    
-    [data-testid="stSidebar"] .stProgress > div > div {
-        background-color: #4f8ef7;
-    }
-    
-    /* 侧边栏标题 */
-    [data-testid="stSidebar"] h1, 
-    [data-testid="stSidebar"] h2, 
-    [data-testid="stSidebar"] h3,
-    [data-testid="stSidebar"] .stMarkdown h3 {
-        color: #ffffff !important;
-    }
-    
-    /* 侧边栏展开器 */
-    [data-testid="stSidebar"] details {
-        background-color: #334155;
-        border-radius: 8px;
-        padding: 4px 8px;
-        margin: 4px 0;
-    }
-    
-    [data-testid="stSidebar"] summary {
-        color: #cbd5e1 !important;
-    }
-    
-    /* 侧边栏按钮 */
-    [data-testid="stSidebar"] .stButton button {
-        background-color: #4f8ef7;
-        color: white;
-        border-radius: 6px;
-        border: none;
-        font-size: 12px;
-    }
-    
-    [data-testid="stSidebar"] .stButton button:hover {
-        background-color: #3b7ae9;
-    }
-    
-    /* 侧边栏滑块 */
-    [data-testid="stSidebar"] .stSlider {
-        color: #cbd5e1;
-    }
-    
-    /* 主区域标题 */
-    .main-title {
-        color: #1e293b;
-        font-size: 24px;
-        font-weight: 600;
-        margin-bottom: 16px;
-    }
-    
-    /* 步骤参考区域 */
-    .stExpander {
-        background-color: #ffffff;
-        border-radius: 8px;
-        border: 1px solid #e2e8f0;
-    }
-    
-    /* 聊天区域 */
-    .stChatMessage {
-        background-color: #ffffff;
-        border-radius: 12px;
-        padding: 8px 12px;
-        margin: 4px 0;
-    }
-    
-    /* 成功提示 */
-    .stSuccess {
-        background-color: #dcfce7;
-        color: #166534;
-    }
-    
-    /* 信息提示 */
-    .stInfo {
-        background-color: #eff6ff;
-        color: #1e40af;
-    }
-    
-    /* 速度标签 */
-    .speed-up {
-        color: #22c55e;
-    }
-    .speed-down {
-        color: #ef4444;
-    }
-    .speed-steady {
-        color: #f59e0b;
-    }
+    [data-testid="stSidebar"] .stMetric { background-color: #334155; border-radius: 8px; padding: 8px; }
+    [data-testid="stSidebar"] .stButton button { background-color: #4f8ef7; color: white; border-radius: 6px; }
+    [data-testid="stSidebar"] details { background-color: #334155; border-radius: 8px; padding: 4px 8px; }
+    .stExpander { background-color: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0; }
+    .stChatMessage { background-color: #ffffff; border-radius: 12px; padding: 8px 12px; }
+    .stSuccess { background-color: #dcfce7; color: #166534; }
+    .coverage-high { color: #22c55e; }
+    .coverage-mid { color: #f59e0b; }
+    .coverage-low { color: #ef4444; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -581,24 +778,23 @@ def main():
         st.metric("完成复盘次数", total_practices)
         
         st.markdown("---")
-        st.markdown("**⚡ 识别速度**")
-        st.markdown("*越练越快*")
+        st.markdown("**⚡ 识别速度 | 📖 完整度**")
         
         for i in range(1, 6):
             avg_time = get_step_avg_time(i)
+            avg_cov = get_step_avg_coverage(i)
             trend = get_step_trend(i)
-            trend_symbol = ""
-            if trend == "↑":
-                trend_symbol = " ↑"
-            elif trend == "↓":
-                trend_symbol = " ↓"
-            else:
-                trend_symbol = " →"
             
-            if avg_time:
-                st.markdown(f"**{STEPS[i]['name']}**: {avg_time:.0f}秒{trend_symbol}")
+            time_str = f"{avg_time:.0f}s" if avg_time else "--s"
+            trend_symbol = trend if trend else ""
+            
+            if avg_cov:
+                cov_class = "coverage-high" if avg_cov >= 70 else ("coverage-mid" if avg_cov >= 50 else "coverage-low")
+                cov_str = f'<span class="{cov_class}">{avg_cov:.0f}%</span>'
             else:
-                st.markdown(f"**{STEPS[i]['name']}**: --秒")
+                cov_str = "--%"
+            
+            st.markdown(f"**{STEPS[i]['name']}**<br><span style='font-size:13px;'>{time_str}{trend_symbol} | {cov_str}</span>", unsafe_allow_html=True)
         
         st.markdown("---")
         st.markdown("**🧠 读盘画像**")
@@ -606,14 +802,9 @@ def main():
             for step_key, weaknesses in st.session_state.reading_profile.items():
                 for w, count in weaknesses.items():
                     if count >= 2:
-                        st.markdown(f"⚠️ {STEPS[step_key]['name']}: {w[:12]}… ×{count}")
+                        st.markdown(f"⚠️ {STEPS[int(step_key)]['name']}: {w[:12]}… ×{count}")
         else:
-            st.caption("暂无数据")
-            
-        st.markdown("---")
-        st.markdown("**🎯 今日目标**")
-        st.markdown("- 完成 3 次复盘")
-        st.markdown("- 每步 < 60秒")
+            st.caption("暂无")
         
         st.markdown("---")
         period_map = {"15分钟": "15", "30分钟": "30", "60分钟": "60"}
@@ -634,12 +825,11 @@ def main():
         if st.session_state.df is not None:
             df = st.session_state.df
             max_bar = len(df) - 1
-            new_bar = st.slider(
-                "📌 K线位置", min_value=60, max_value=max_bar,
-                value=st.session_state.current_bar, key="bar_slider"
-            )
+            new_bar = st.slider("📌 K线位置", 60, max_bar, st.session_state.current_bar)
             if new_bar != st.session_state.current_bar:
                 st.session_state.current_bar = new_bar
+                analyzer = StructureAnalyzer(df, new_bar, lookback=80)
+                st.session_state.structure_report, st.session_state.detected_elements = analyzer.generate_full_report()
                 reset_step_progress()
                 st.session_state.practice_start_time = time.time()
                 st.session_state.current_step_start_time = time.time()
@@ -649,6 +839,8 @@ def main():
             if col1.button("🎲 随机", use_container_width=True):
                 new_bar = random.randint(80, max_bar - 20)
                 st.session_state.current_bar = new_bar
+                analyzer = StructureAnalyzer(df, new_bar, lookback=80)
+                st.session_state.structure_report, st.session_state.detected_elements = analyzer.generate_full_report()
                 reset_step_progress()
                 st.session_state.practice_start_time = time.time()
                 st.session_state.current_step_start_time = time.time()
@@ -659,34 +851,23 @@ def main():
                 st.session_state.current_step_start_time = time.time()
                 st.rerun()
 
-            st.caption(f"当前K线: K{st.session_state.current_bar} / 共{len(df)}根")
+            st.caption(f"K{st.session_state.current_bar} / {len(df)}根")
 
     # 主界面
     if st.session_state.df is None:
-        st.markdown('<div class="main-title">👈 请从左侧选择品种开始训练</div>', unsafe_allow_html=True)
+        st.markdown("## 👈 请从左侧选择品种开始训练")
         st.markdown("""
-        <div style="background-color: #ffffff; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0;">
-        <h3 style="color: #1e293b;">Al Brooks 5步框架（习惯培养版）</h3>
-        <p style="color: #475569;">这不是考试，这是练习。目标是<strong>每天按固定流程复盘</strong>，形成习惯，提高识别速度。</p>
-        
-        <h4 style="color: #334155;">训练流程：</h4>
-        <ol style="color: #475569;">
-            <li>选择品种和周期</li>
-            <li>按照5步框架逐步分析图表</li>
-            <li>每步有2轮对话，完成后自动进入下一步</li>
-            <li>完成5步后，系统记录耗时和观察完整度</li>
-        </ol>
-        
-        <h4 style="color: #334155;">Al Brooks 5步框架：</h4>
-        <ul style="color: #475569;">
-            <li><strong>第1步</strong>：画线 - 找到通道、楔形、超出(Overshoot)</li>
-            <li><strong>第2步</strong>：形态 - 识别双顶/双底、三角形等（形态≠预测）</li>
-            <li><strong>第3步</strong>：特殊K线 - 找到IB、OB、大K线、连续强势K线</li>
-            <li><strong>第4步</strong>：值得做吗 - 先评估风险回报，再决定入场</li>
-            <li><strong>第5步</strong>：管理仓位 - 持仓期间的计划</li>
+        <div style="background:#fff;padding:20px;border-radius:12px;border:1px solid #e2e8f0;">
+        <h3>Al Brooks 5步训练器 V4.3</h3>
+        <p>AI会先独立分析图表结构，再批改你的观察。</p>
+        <ul>
+            <li><strong>第1步</strong>：画线 - 通道、楔形、超出</li>
+            <li><strong>第2步</strong>：形态 - 双顶/双底、三角形、推进波</li>
+            <li><strong>第3步</strong>：特殊K线 - IB、OB、IOI、大K线</li>
+            <li><strong>第4步</strong>：值得做吗 - 概率、空间、风险</li>
+            <li><strong>第5步</strong>：管理仓位 - 退出、移动止损</li>
         </ul>
-        
-        <p style="color: #64748b; font-style: italic;">💡 画线没有唯一正确答案，灵活比完美更重要。</p>
+        <p style="color:#64748b;">💡 画线没有唯一正确答案，灵活比完美更重要。</p>
         </div>
         """, unsafe_allow_html=True)
         return
@@ -700,26 +881,33 @@ def main():
     col1, col2, col3 = st.columns([2, 2, 3])
     col1.markdown(f"**{symbol_name}** ({st.session_state.symbol}) | K{bar}")
     col2.markdown(f"当前: **{current_step['name']}**")
-    
     completed_count = sum(st.session_state.step_completed.values())
-    col3.progress(completed_count / 5, text=f"{completed_count}/5步完成")
+    col3.progress(completed_count / 5, text=f"{completed_count}/5步")
 
     fig = build_chart(df, bar, step_name=current_step["name"])
     st.plotly_chart(fig, use_container_width=True)
 
     # 全部完成
     if all(st.session_state.step_completed.values()):
-        st.success("🎉 恭喜！完成一次完整复盘！")
-        
+        st.success("🎉 完成一次完整复盘！")
         if st.session_state.practice_start_time:
             elapsed = time.time() - st.session_state.practice_start_time
-            st.metric("本次复盘总耗时", f"{elapsed:.0f}秒")
+            st.metric("本次总耗时", f"{elapsed:.0f}秒")
         
-        st.info("💡 复盘次数越多，识别速度会越快。继续练习！")
+        st.markdown("**本次详情：**")
+        cols = st.columns(5)
+        for i in range(1, 6):
+            times = st.session_state.step_times[i]
+            coverages = st.session_state.step_coverage[i]
+            last_time = times[-1] if times else 0
+            last_cov = coverages[-1] * 100 if coverages else 0
+            cols[i-1].metric(STEPS[i]['name'], f"{last_time:.0f}s", f"{last_cov:.0f}%")
         
-        if st.button("🔄 开始下一次复盘", type="primary"):
+        if st.button("🔄 下一次复盘", type="primary"):
             new_bar = random.randint(80, len(df) - 20)
             st.session_state.current_bar = new_bar
+            analyzer = StructureAnalyzer(df, new_bar, lookback=80)
+            st.session_state.structure_report, st.session_state.detected_elements = analyzer.generate_full_report()
             reset_step_progress()
             st.session_state.practice_start_time = time.time()
             st.session_state.current_step_start_time = time.time()
@@ -733,58 +921,76 @@ def main():
     st.markdown(f"*{current_step['question']}*")
 
     with st.expander("📖 本步骤参考", expanded=False):
-        st.markdown("**核心观察要素：**")
         for ce in current_step["core_elements"]:
             st.markdown(f"- {ce}")
-        st.success(f"✅ **好的示例：** {current_step['example_good']}")
-        st.warning(f"⚠️ **不好的示例：** {current_step['example_bad']}")
+        st.success(f"✅ {current_step['example_good']}")
+        st.warning(f"⚠️ {current_step['example_bad']}")
 
-    # 对话历史
+    with st.expander("🤖 AI独立分析结果（仅用于批改，不直接抄答案）", expanded=False):
+        st.code(st.session_state.structure_report or "未生成", language=None)
+        st.caption(f"当前图表实际存在的形态：{', '.join(st.session_state.detected_elements) if st.session_state.detected_elements else '无明显形态'}")
+
+    # 对话
     conv = st.session_state.conversations[current_step_num]
     for msg in conv:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # 当前步骤已完成
     if st.session_state.step_completed[current_step_num]:
+        if st.session_state.current_step_start_time:
+            elapsed = time.time() - st.session_state.current_step_start_time
+            st.session_state.step_times[current_step_num].append(elapsed)
         st.success(f"✅ {current_step['name']} 完成！")
         if current_step_num < 5:
-            if st.button(f"➡️ 进入第{current_step_num + 1}步", type="primary"):
-                if st.session_state.current_step_start_time:
-                    elapsed = time.time() - st.session_state.current_step_start_time
-                    st.session_state.step_times[current_step_num].append(elapsed)
-                
-                st.session_state.step = current_step_num + 1
-                st.session_state.current_step_start_time = time.time()
-                st.rerun()
+            time.sleep(1.5)
+            st.session_state.step = current_step_num + 1
+            st.session_state.current_step_start_time = time.time()
+            st.rerun()
         return
 
-    # 用户输入
     round_num = st.session_state.round_count[current_step_num]
+    max_rounds = MAX_ROUNDS
     
-    if round_num < MAX_ROUNDS_PER_STEP:
-        placeholder = "请描述你的观察..." if round_num == 0 else f"第{round_num + 1}轮，可以补充..."
+    if round_num < max_rounds:
+        placeholder = "请描述你的观察..." if round_num == 0 else "可以补充..."
         user_input = st.chat_input(placeholder)
 
         if user_input:
             conv.append({"role": "user", "content": user_input})
-            st.session_state.user_answers[current_step_num] += f"\n[第{round_num + 1}轮] {user_input}"
+            st.session_state.user_answers[current_step_num] += f"\n[第{round_num+1}轮] {user_input}"
             st.session_state.round_count[current_step_num] += 1
 
-            with st.spinner("教练思考中..."):
+            with st.spinner("AI分析中..."):
                 coach_reply = call_coach(
                     step_num=current_step_num,
                     conversation_history=conv,
+                    structure_report=st.session_state.structure_report,
+                    detected_elements=st.session_state.detected_elements,
                     step_summaries=st.session_state.step_summaries,
                     reading_profile=st.session_state.reading_profile,
+                    round_num=round_num + 1,
+                    max_rounds=max_rounds,
                 )
 
             conv.append({"role": "assistant", "content": coach_reply})
             
-            if "[NEXT]" in coach_reply or round_num + 1 >= MAX_ROUNDS_PER_STEP:
+            if "[NEXT]" in coach_reply or round_num + 1 >= max_rounds:
                 st.session_state.step_completed[current_step_num] = True
                 summary = summarize_step(current_step_num, st.session_state.user_answers[current_step_num])
                 st.session_state.step_summaries[current_step_num] = summary
+                
+                covered, total, ratio = calculate_coverage(
+                    st.session_state.user_answers[current_step_num],
+                    st.session_state.detected_elements
+                )
+                st.session_state.step_coverage[current_step_num].append(ratio)
+                
+                if ratio < 0.6:
+                    step_key = str(current_step_num)
+                    if step_key not in st.session_state.reading_profile:
+                        st.session_state.reading_profile[step_key] = {}
+                    st.session_state.reading_profile[step_key]["观察不完整"] = \
+                        st.session_state.reading_profile[step_key].get("观察不完整", 0) + 1
                 
             st.rerun()
 

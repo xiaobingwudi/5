@@ -135,12 +135,16 @@ def find_swing_points(df, lookback=60, pivot_window=3):
         l = sub.iloc[i]["low"]
         orig_idx = start + i
 
-        if all(sub.iloc[i - j]["high"] < h for j in range(1, w + 1)) and \
-           all(sub.iloc[i + j]["high"] < h for j in range(1, w + 1)):
+        # 摆动高点：左右各 w 根K线的高点都低于当前
+        left_higher = all(sub.iloc[i - j]["high"] < h for j in range(1, w + 1))
+        right_higher = all(sub.iloc[i + j]["high"] < h for j in range(1, w + 1))
+        if left_higher and right_higher:
             swing_highs.append({"idx": orig_idx, "price": h})
 
-        if all(sub.iloc[i - j]["low"] > l for j inrange(1, w + 1)) and \
-           all(sub.iloc[i + j]["low"] > l for j in range(1, w + 1)):
+        # 摆动低点：左右各 w 根K线的低点都高于当前
+        left_lower = all(sub.iloc[i - j]["low"] > l for j in range(1, w + 1))
+        right_lower = all(sub.iloc[i + j]["low"] > l for j in range(1, w + 1))
+        if left_lower and right_lower:
             swing_lows.append({"idx": orig_idx, "price": l})
 
     return swing_highs, swing_lows
@@ -166,7 +170,7 @@ def detect_trend(swing_highs, swing_lows):
         return "横盘震荡"
 
 
-def detect_bar_patterns(df, bar, lookback=40):
+def detect_bar_patterns(df, bar, lookback=50):
     """识别K线形态：V3.0 扩展版本"""
     start = max(0, bar - lookback)
     sub = df.iloc[start:bar + 1].copy().reset_index(drop=True)
@@ -203,7 +207,6 @@ def detect_bar_patterns(df, bar, lookback=40):
     # 连续同向强势K线（无重叠）
     streak = 1
     streak_dir = None
-    low_wick_ratio = 1.0
     for i in range(n - 2, -1, -1):
         row = sub.iloc[i]
         curr = sub.iloc[i+1]
@@ -538,10 +541,11 @@ def init_state():
         "step_summaries": {},
         "reading_profile": {},
         "round_count": {i: 0 for i in range(1, 6)},
-        # V3.0 新增：统计信息，用于“习惯培养”模式
+        # V3.0 新增：统计信息，用于"习惯培养"模式
         "total_practices": 0,  # 完成的完整复盘次数
         "step_scores": {i: [] for i in range(1, 6)},  # 存储每次练习每步的分数
         "practice_times": [],  # 存储每次练习的耗时（秒）
+        "practice_start_time": None,  # 当前练习开始时间
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -572,23 +576,25 @@ def load_new_symbol(code, period_value):
         st.session_state.swing_lows = sl
         st.session_state.structure_report = build_structure_report(df, bar)
         reset_step_progress()
+        # 重置计时
+        st.session_state.practice_start_time = time.time()
         return True
 
 
-# ==================== 模拟评分函数（用于统计）====================
-def simulate_score(user_answer, core_elements):
-    """
-    模拟一个简单的评分：根据用户回答中出现的核心要素数量计算完整度。
-    真实场景下可以调用AI或更复杂的逻辑，这里用于演示统计面板。
-    """
+def calculate_step_score(user_answer, core_elements):
+    """简单计算步骤完成度分数"""
     if not user_answer:
         return 0
     score = 0
+    total = len(core_elements)
+    user_answer_lower = user_answer.lower()
     for element in core_elements:
-        # 简单检查核心词是否出现，真实场景可以更精细
-        if any(keyword in user_answer for keyword in element.split()[:2]): # 非常粗糙的模拟
+        # 提取关键词（取前几个中文字符作为匹配依据）
+        keywords = element.replace("：", ":").split(":")[0].strip()
+        # 简单匹配：如果用户回答中包含关键词，则认为覆盖
+        if keywords in user_answer or any(k in user_answer_lower for k in keywords.split("、")[:2]):
             score += 1
-    return (score / len(core_elements)) * 100
+    return (score / total) * 100
 
 
 # ==================== 主界面 ====================
@@ -606,6 +612,10 @@ def main():
     """, unsafe_allow_html=True)
 
     init_state()
+
+    # 开始计时
+    if st.session_state.practice_start_time is None and st.session_state.df is not None:
+        st.session_state.practice_start_time = time.time()
 
     # ── 侧边栏（统计信息）──────────────────────
     with st.sidebar:
@@ -655,7 +665,7 @@ def main():
         st.markdown("- 单次耗时 < 5 分钟")
         
         st.markdown("---")
-        # 品种选择部分保持不变
+        # 品种选择部分
         period_map = {"15分钟": "15", "30分钟": "30", "60分钟": "60"}
         period = st.selectbox("周期", list(period_map.keys()), index=1)
         period_value = period_map[period]
@@ -685,8 +695,170 @@ def main():
                 st.session_state.swing_lows = sl
                 st.session_state.structure_report = build_structure_report(df, new_bar)
                 reset_step_progress()
+                st.session_state.practice_start_time = time.time()
                 st.rerun()
 
             col1, col2 = st.columns(2)
             if col1.button("🎲 随机", use_container_width=True):
-                new_bar = random
+                new_bar = random.randint(80, max_bar - 20)
+                st.session_state.current_bar = new_bar
+                sh, sl = find_swing_points(df, lookback=80)
+                st.session_state.swing_highs = sh
+                st.session_state.swing_lows = sl
+                st.session_state.structure_report = build_structure_report(df, new_bar)
+                reset_step_progress()
+                st.session_state.practice_start_time = time.time()
+                st.rerun()
+
+            if col2.button("🔄 重置", use_container_width=True):
+                reset_step_progress()
+                st.session_state.practice_start_time = time.time()
+                st.rerun()
+
+            st.caption(f"K{st.session_state.current_bar} / 共{len(df)}根")
+
+    # ── 主界面 ──────────────────────────────────────
+    if st.session_state.df is None:
+        st.markdown("## 👈 请从左侧选择品种开始训练")
+        st.markdown("""
+        ### Al Brooks 5步框架（习惯培养版）
+        
+        这不是考试，这是练习。目标是**每天按固定流程复盘**，形成习惯。
+        
+        - **第1步**：画线 - 找到通道、楔形、超出(Overshoot)
+        - **第2步**：形态 - 识别双顶/双底、三角形等
+        - **第3步**：特殊K线 - 找到IB、OB、IOI、大K线、连续强势K线
+        - **第4步**：入场点 - 标记入场K线、方向、价格
+        - **第5步**：交易管理 - 止损、目标、仓位、概率、退出条件
+        
+        完成5步后，系统会记录你的完成次数和观察完整度。
+        """)
+        return
+
+    df = st.session_state.df
+    bar = st.session_state.current_bar
+    current_step_num = st.session_state.step
+    current_step = STEPS[current_step_num]
+
+    symbol_name = SYMBOL_NAMES.get(st.session_state.symbol, st.session_state.symbol)
+    col1, col2, col3 = st.columns([2, 2, 3])
+    col1.markdown(f"**{symbol_name}** ({st.session_state.symbol}) | K{bar}")
+    col2.markdown(f"当前: **{current_step['name']}**")
+    passed_count = sum(st.session_state.step_passed.values())
+    col3.progress(passed_count / 5, text=f"{passed_count}/5步完成")
+
+    fig = build_chart(
+        df, bar,
+        swing_highs=st.session_state.swing_highs,
+        swing_lows=st.session_state.swing_lows,
+        step_name=current_step["name"],
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── 全部完成 ──
+    if all(st.session_state.step_passed.values()):
+        st.success("🎉 恭喜！完成一次完整复盘！")
+        
+        # 计算本次练习的统计信息
+        if st.session_state.practice_start_time:
+            elapsed = time.time() - st.session_state.practice_start_time
+            st.session_state.practice_times.append(elapsed)
+        
+        # 计算各步得分
+        step_scores_this_time = []
+        for i in range(1, 6):
+            user_ans = st.session_state.user_answers[i]
+            score = calculate_step_score(user_ans, STEPS[i]["core_elements"])
+            st.session_state.step_scores[i].append(score)
+            step_scores_this_time.append(score)
+        
+        st.session_state.total_practices += 1
+        
+        # 显示本次得分
+        col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
+        col_s1.metric("步骤1", f"{step_scores_this_time[0]:.0f}分")
+        col_s2.metric("步骤2", f"{step_scores_this_time[1]:.0f}分")
+        col_s3.metric("步骤3", f"{step_scores_this_time[2]:.0f}分")
+        col_s4.metric("步骤4", f"{step_scores_this_time[3]:.0f}分")
+        col_s5.metric("步骤5", f"{step_scores_this_time[4]:.0f}分")
+        
+        if st.button("🔄 开始下一次复盘", type="primary"):
+            # 随机换一根K线
+            new_bar = random.randint(80, len(df) - 20)
+            st.session_state.current_bar = new_bar
+            sh, sl = find_swing_points(df, lookback=80)
+            st.session_state.swing_highs = sh
+            st.session_state.swing_lows = sl
+            st.session_state.structure_report = build_structure_report(df, new_bar)
+            reset_step_progress()
+            st.session_state.practice_start_time = time.time()
+            st.rerun()
+        return
+
+    # ── 当前步骤 ──
+    st.markdown("---")
+    st.markdown(f"## {current_step['name']} — {current_step['title']}")
+    st.markdown(f"*{current_step['question']}*")
+
+    with st.expander("📖 本步骤参考", expanded=False):
+        st.markdown("**核心观察要素：**")
+        for ce in current_step["core_elements"]:
+            st.markdown(f"- {ce}")
+        st.success(f"**好的示例：** {current_step['example_good']}")
+        st.warning(f"**不好的示例：** {current_step['example_bad']}")
+
+    with st.expander("🔍 结构分析数据（AI视角，仅供参考）", expanded=False):
+        st.code(st.session_state.structure_report or "未生成", language=None)
+
+    # 显示历史对话
+    conv = st.session_state.conversations[current_step_num]
+    for msg in conv:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # ── 已通过当前步骤 ──
+    if st.session_state.step_passed[current_step_num]:
+        st.success(f"✅ {current_step['name']} 观察到位！")
+        if current_step_num < 5:
+            if st.button(f"➡️ 进入第{current_step_num + 1}步", type="primary"):
+                st.session_state.step = current_step_num + 1
+                st.rerun()
+        return
+
+    # ── 用户输入与对话 ──
+    round_num = st.session_state.round_count[current_step_num]
+    
+    if round_num < 3:  # 最多3轮对话
+        placeholder = "请描述你的观察..." if round_num == 0 else f"第{round_num + 1}轮，可以补充..."
+        user_input = st.chat_input(placeholder)
+
+        if user_input:
+            conv.append({"role": "user", "content": user_input})
+            st.session_state.user_answers[current_step_num] += f"\n[第{round_num + 1}轮] {user_input}"
+            st.session_state.round_count[current_step_num] += 1
+
+            with st.spinner("教练思考中..."):
+                coach_reply = call_coach(
+                    step_num=current_step_num,
+                    conversation_history=conv,
+                    structure_report=st.session_state.structure_report,
+                    step_summaries=st.session_state.step_summaries,
+                    reading_profile=st.session_state.reading_profile,
+                )
+
+            conv.append({"role": "assistant", "content": coach_reply})
+            
+            # 如果教练认为观察到位，或者达到3轮，则标记为完成
+            if "可以进入下一步" in coach_reply or round_num + 1 >= 3:
+                st.session_state.step_passed[current_step_num] = True
+                # 生成摘要
+                summary = summarize_step(current_step_num, st.session_state.user_answers[current_step_num])
+                st.session_state.step_summaries[current_step_num] = summary
+                # 记录薄弱点（简单模拟，后续可优化）
+                # 这里简单起见，不自动记录，让AI在后续训练中引导
+                
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()

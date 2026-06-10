@@ -121,6 +121,8 @@ STEPS = {
     },
 }
 
+MAX_ROUNDS = 3
+
 # ==================== 结构分析函数 ====================
 def find_swing_points(df, lookback=60, pivot_window=3):
     """识别摆动高低点（swing high/low）"""
@@ -135,13 +137,11 @@ def find_swing_points(df, lookback=60, pivot_window=3):
         l = sub.iloc[i]["low"]
         orig_idx = start + i
 
-        # 摆动高点：左右各 w 根K线的高点都低于当前
         left_higher = all(sub.iloc[i - j]["high"] < h for j in range(1, w + 1))
         right_higher = all(sub.iloc[i + j]["high"] < h for j in range(1, w + 1))
         if left_higher and right_higher:
             swing_highs.append({"idx": orig_idx, "price": h})
 
-        # 摆动低点：左右各 w 根K线的低点都高于当前
         left_lower = all(sub.iloc[i - j]["low"] > l for j in range(1, w + 1))
         right_lower = all(sub.iloc[i + j]["low"] > l for j in range(1, w + 1))
         if left_lower and right_lower:
@@ -171,7 +171,7 @@ def detect_trend(swing_highs, swing_lows):
 
 
 def detect_bar_patterns(df, bar, lookback=50):
-    """识别K线形态：V3.0 扩展版本"""
+    """识别K线形态"""
     start = max(0, bar - lookback)
     sub = df.iloc[start:bar + 1].copy().reset_index(drop=True)
     n = len(sub)
@@ -188,14 +188,11 @@ def detect_bar_patterns(df, bar, lookback=50):
         total = ch - cl
         body_ratio = body / total if total > 0 else 0
 
-        # 内包线
         if ch < ph and cl > pl:
             patterns.append(f"K{orig_idx}: 内包线(IB)")
-        # 外包线
         elif ch > ph and cl < pl:
             patterns.append(f"K{orig_idx}: 外包线(OB)")
 
-        # 大K线（实体占比>80%）
         if body_ratio > 0.80:
             direction = "阳线" if cc > co else "阴线"
             if (cc > co and cc > ch - total * 0.2) or (cc < co and cc < cl + total * 0.2):
@@ -204,7 +201,7 @@ def detect_bar_patterns(df, bar, lookback=50):
                 close_pos = "收盘在中部"
             patterns.append(f"K{orig_idx}: 大{direction}({body_ratio*100:.0f}%实体, {close_pos})")
 
-    # 连续同向强势K线（无重叠）
+    # 连续同向强势K线
     streak = 1
     streak_dir = None
     for i in range(n - 2, -1, -1):
@@ -214,7 +211,6 @@ def detect_bar_patterns(df, bar, lookback=50):
         if streak_dir is None:
             streak_dir = is_bull
         elif is_bull == streak_dir:
-            # 检查与前一根K线是否有重叠
             overlap = min(curr["high"], row["high"]) - max(curr["low"], row["low"])
             if overlap <= 0:
                 streak += 1
@@ -233,7 +229,7 @@ def detect_bar_patterns(df, bar, lookback=50):
         k3 = sub.iloc[i]
         if (k2["high"] < k1["high"] and k2["low"] > k1["low"]) and \
            (k3["high"] > k2["high"] and k3["low"] < k2["low"]):
-            patterns.append(f"K{start+i-2}-K{start+i}: IOI模式 (外包->内包->外包)")
+            patterns.append(f"K{start+i-2}-K{start+i}: IOI模式")
 
     return patterns[-20:]
 
@@ -243,7 +239,7 @@ def detect_double_top_bottom(swing_highs, swing_lows):
     if len(swing_highs) >= 2:
         h1, h2 = swing_highs[-2], swing_highs[-1]
         diff_pct = abs(h2["price"] - h1["price"]) / h1["price"] if h1["price"] > 0 else 1
-        if diff_pct < 0.015:  # 容忍度 1.5%
+        if diff_pct < 0.015:
             if h2["price"] > h1["price"]:
                 label = "更高高点"
             elif h2["price"] < h1["price"]:
@@ -268,7 +264,7 @@ def detect_double_top_bottom(swing_highs, swing_lows):
 
 
 def build_structure_report(df, bar):
-    """生成完整结构分析报告，供AI使用"""
+    """生成完整结构分析报告"""
     swing_highs, swing_lows = find_swing_points(df, lookback=80)
     swing_highs = [s for s in swing_highs if s["idx"] <= bar]
     swing_lows = [s for s in swing_lows if s["idx"] <= bar]
@@ -306,31 +302,29 @@ def build_structure_report(df, bar):
     return "\n".join(lines)
 
 
-# ==================== AI 提示词 (V3.0 彻底重写) ====================
+# ==================== AI 提示词 ====================
 COACH_SYSTEM = """你是 Al Brooks 价格行为分析教练。
 
 【你的角色】
-- 你正在训练一个交易员养成“每天按固定流程复盘”的习惯。
+- 你正在训练一个交易员养成"每天按固定流程复盘"的习惯。
 - 你不是考官，你是陪练。
-- 目标不是让用户“答对”，而是帮他“逐步形成自己的观察框架”。
+- 目标不是让用户"答对"，而是帮他"逐步形成自己的观察框架"。
 
 【如何引导】
 - 优先观察用户是否遗漏了当前步骤最核心的几个要素。
 - 鼓励他引用具体K线编号、价格、形态。
-- 如果他提出的画法/判断与后台分析不一致，只要逻辑合理、有理有据，都视为有效。
+- 如果他提出的画法/判断与后台分析不一致，只要逻辑合理，都视为有效。
 - 如果观察明显错误，用提问引导他重新看，而不是直接否定。
-- 对他“已经做得好的部分”要给予正反馈。
+- 对他"已经做得好的部分"要给予正反馈。
 
 【灵活性原则】
 - 双顶/双底很少完美，不要求精准。
 - 通道画法可以有多种，关键是能否解释得通。
-- 灵活判断比追求完美更重要。
 
 【输出要求】
 - 反馈请控制在120字以内。
-- 不要输出PASS/FAIL。
-- 如果你认为他已经描述得很完整，并且给出了具体K线编号和理由，可以说“这一轮的观察很到位，可以进入下一步了”。
-- 如果他遗漏较多，可以说“这次我们主要看看[具体缺失的点]，你注意到了吗？”
+- 如果你认为他已经描述得很完整，可以说"这一轮的观察很到位，可以进入下一步了"。
+- 如果他遗漏较多，可以说"这次我们主要看看[具体缺失的点]，你注意到了吗？"
 
 【当前训练步骤】
 {step_info}
@@ -338,7 +332,7 @@ COACH_SYSTEM = """你是 Al Brooks 价格行为分析教练。
 【用户历史薄弱点】
 {profile_text}
 
-【图表结构数据】（仅供参考，不要直接说出“后台检测到…”）
+【图表结构数据】（仅供参考，不要直接说出"后台检测到…"）
 {structure_report}
 
 【前几步用户发现】
@@ -386,7 +380,6 @@ def get_ai_client():
 
 def call_coach(step_num, conversation_history, structure_report, step_summaries, reading_profile):
     client, model = get_ai_client()
-    step = STEPS[step_num]
     system = COACH_SYSTEM.format(
         step_info=build_step_info(step_num),
         profile_text=build_profile_text(reading_profile),
@@ -442,7 +435,7 @@ def load_data(symbol, period="30"):
             "low": "low", "close": "close", "volume": "volume"
         })
         return df.reset_index(drop=True)
-    except:
+    except Exception:
         return None
 
 
@@ -541,11 +534,10 @@ def init_state():
         "step_summaries": {},
         "reading_profile": {},
         "round_count": {i: 0 for i in range(1, 6)},
-        # V3.0 新增：统计信息，用于"习惯培养"模式
-        "total_practices": 0,  # 完成的完整复盘次数
-        "step_scores": {i: [] for i in range(1, 6)},  # 存储每次练习每步的分数
-        "practice_times": [],  # 存储每次练习的耗时（秒）
-        "practice_start_time": None,  # 当前练习开始时间
+        "total_practices": 0,
+        "step_scores": {i: [] for i in range(1, 6)},
+        "practice_times": [],
+        "practice_start_time": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -576,13 +568,11 @@ def load_new_symbol(code, period_value):
         st.session_state.swing_lows = sl
         st.session_state.structure_report = build_structure_report(df, bar)
         reset_step_progress()
-        # 重置计时
         st.session_state.practice_start_time = time.time()
         return True
 
 
 def calculate_step_score(user_answer, core_elements):
-    """简单计算步骤完成度分数"""
     if not user_answer:
         return 0
     score = 0
@@ -590,8 +580,7 @@ def calculate_step_score(user_answer, core_elements):
     user_answer_lower = user_answer.lower()
     for element in core_elements:
         # 提取关键词（取前几个中文字符作为匹配依据）
-        keywords = element.replace("：", ":").split(":")[0].strip()
-        # 简单匹配：如果用户回答中包含关键词，则认为覆盖
+        keywords = element.split("：")[0].strip() if "：" in element else element.split(":")[0].strip()
         if keywords in user_answer or any(k in user_answer_lower for k in keywords.split("、")[:2]):
             score += 1
     return (score / total) * 100
@@ -613,27 +602,23 @@ def main():
 
     init_state()
 
-    # 开始计时
     if st.session_state.practice_start_time is None and st.session_state.df is not None:
         st.session_state.practice_start_time = time.time()
 
-    # ── 侧边栏（统计信息）──────────────────────
+    # 侧边栏
     with st.sidebar:
         st.markdown("### 📊 训练统计")
         st.markdown("---")
         
-        # 显示完成次数
         total_practices = st.session_state.total_practices
         st.metric("完成复盘次数", total_practices)
         
-        # 显示平均分
         all_scores = []
         for step_scores in st.session_state.step_scores.values():
             all_scores.extend(step_scores)
         avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
         st.metric("平均观察完整度", f"{avg_score:.1f}%")
         
-        # 显示最近一次耗时
         if st.session_state.practice_times:
             last_time = st.session_state.practice_times[-1]
             st.metric("最近一次复盘耗时", f"{last_time:.0f}秒")
@@ -656,7 +641,7 @@ def main():
                     if count >= 2:
                         st.markdown(f"⚠️ 步骤{step_key}: {w[:10]}… ×{count}")
         else:
-            st.caption("暂无数据，完成一次复盘后显示")
+            st.caption("暂无数据")
             
         st.markdown("---")
         st.markdown("**🎯 今日目标**")
@@ -665,7 +650,6 @@ def main():
         st.markdown("- 单次耗时 < 5 分钟")
         
         st.markdown("---")
-        # 品种选择部分
         period_map = {"15分钟": "15", "30分钟": "30", "60分钟": "60"}
         period = st.selectbox("周期", list(period_map.keys()), index=1)
         period_value = period_map[period]
@@ -717,7 +701,7 @@ def main():
 
             st.caption(f"K{st.session_state.current_bar} / 共{len(df)}根")
 
-    # ── 主界面 ──────────────────────────────────────
+    # 主界面
     if st.session_state.df is None:
         st.markdown("## 👈 请从左侧选择品种开始训练")
         st.markdown("""
@@ -726,8 +710,7 @@ def main():
         这不是考试，这是练习。目标是**每天按固定流程复盘**，形成习惯。
         
         - **第1步**：画线 - 找到通道、楔形、超出(Overshoot)
-        - **第2步**：形态 - 识别双顶/双底、三角形等
-        - **第3步**：特殊K线 - 找到IB、OB、IOI、大K线、连续强势K线
+        - **第2步**：形态 - 识别双顶/双底、三角形等        - **第3步**：特殊K线 - 找到IB、OB、IOI、大K线、连续强势K线
         - **第4步**：入场点 - 标记入场K线、方向、价格
         - **第5步**：交易管理 - 止损、目标、仓位、概率、退出条件
         
@@ -755,16 +738,14 @@ def main():
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── 全部完成 ──
+    # 全部完成
     if all(st.session_state.step_passed.values()):
         st.success("🎉 恭喜！完成一次完整复盘！")
         
-        # 计算本次练习的统计信息
         if st.session_state.practice_start_time:
             elapsed = time.time() - st.session_state.practice_start_time
             st.session_state.practice_times.append(elapsed)
         
-        # 计算各步得分
         step_scores_this_time = []
         for i in range(1, 6):
             user_ans = st.session_state.user_answers[i]
@@ -774,7 +755,6 @@ def main():
         
         st.session_state.total_practices += 1
         
-        # 显示本次得分
         col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
         col_s1.metric("步骤1", f"{step_scores_this_time[0]:.0f}分")
         col_s2.metric("步骤2", f"{step_scores_this_time[1]:.0f}分")
@@ -783,7 +763,6 @@ def main():
         col_s5.metric("步骤5", f"{step_scores_this_time[4]:.0f}分")
         
         if st.button("🔄 开始下一次复盘", type="primary"):
-            # 随机换一根K线
             new_bar = random.randint(80, len(df) - 20)
             st.session_state.current_bar = new_bar
             sh, sl = find_swing_points(df, lookback=80)
@@ -795,7 +774,7 @@ def main():
             st.rerun()
         return
 
-    # ── 当前步骤 ──
+    # 当前步骤
     st.markdown("---")
     st.markdown(f"## {current_step['name']} — {current_step['title']}")
     st.markdown(f"*{current_step['question']}*")
@@ -810,13 +789,11 @@ def main():
     with st.expander("🔍 结构分析数据（AI视角，仅供参考）", expanded=False):
         st.code(st.session_state.structure_report or "未生成", language=None)
 
-    # 显示历史对话
     conv = st.session_state.conversations[current_step_num]
     for msg in conv:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # ── 已通过当前步骤 ──
     if st.session_state.step_passed[current_step_num]:
         st.success(f"✅ {current_step['name']} 观察到位！")
         if current_step_num < 5:
@@ -825,10 +802,9 @@ def main():
                 st.rerun()
         return
 
-    # ── 用户输入与对话 ──
     round_num = st.session_state.round_count[current_step_num]
     
-    if round_num < 3:  # 最多3轮对话
+    if round_num < MAX_ROUNDS:
         placeholder = "请描述你的观察..." if round_num == 0 else f"第{round_num + 1}轮，可以补充..."
         user_input = st.chat_input(placeholder)
 
@@ -848,14 +824,10 @@ def main():
 
             conv.append({"role": "assistant", "content": coach_reply})
             
-            # 如果教练认为观察到位，或者达到3轮，则标记为完成
-            if "可以进入下一步" in coach_reply or round_num + 1 >= 3:
+            if "可以进入下一步" in coach_reply or round_num + 1 >= MAX_ROUNDS:
                 st.session_state.step_passed[current_step_num] = True
-                # 生成摘要
                 summary = summarize_step(current_step_num, st.session_state.user_answers[current_step_num])
                 st.session_state.step_summaries[current_step_num] = summary
-                # 记录薄弱点（简单模拟，后续可优化）
-                # 这里简单起见，不自动记录，让AI在后续训练中引导
                 
             st.rerun()
 

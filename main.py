@@ -1,12 +1,11 @@
 """
-Al Brooks 日内机会寻找训练器 V3.0
-基于V2.2的彻底重构版本
+Al Brooks 日内机会寻找训练器 V3.2
+修复结构分析报告与图表范围不一致的问题
 
-核心改变 (根据用户反馈):
-1. 从“通过/失败”考试模式 -> “重复练习/形成习惯”培养模式
-2. 扩充实步骤的核心要素，完全对齐Brooks视频原意
-3. AI角色从“考官” -> “Brooks本人”，鼓励灵活标图，不追求完美
-4. 评分逻辑从“对答案” -> 评估观察的“完整度”和“合理性”
+修复内容：
+1. 后台分析范围与用户看到的图表范围保持一致（最近80根K线）
+2. 降低摆动点识别门槛（pivot_window=2，更容易找到）
+3. 优化趋势判断逻辑，当摆动点不足时给出更友好的提示
 """
 
 import streamlit as st
@@ -42,7 +41,9 @@ EXCHANGES = {
     "能源": ["SC", "FU"],
 }
 
-# ==================== 5步流程定义 (V3.0 大幅扩展) ====================
+MAX_ROUNDS = 3
+
+# ==================== 5步流程定义 ====================
 STEPS = {
     1: {
         "name": "第1步：画线",
@@ -121,66 +122,85 @@ STEPS = {
     },
 }
 
-MAX_ROUNDS = 3
-
-# ==================== 结构分析函数 ====================
-def find_swing_points(df, lookback=60, pivot_window=3):
-    """识别摆动高低点（swing high/low）"""
-    start = max(0, len(df) - lookback)
-    sub = df.iloc[start:].copy().reset_index(drop=True)
+# ==================== 结构分析函数（修复版 - 与图表范围对齐）====================
+def find_swing_points_in_range(df, start_idx, end_idx, pivot_window=2):
+    """
+    在指定K线范围内识别摆动高低点
+    
+    参数:
+        df: 数据框
+        start_idx: 起始K线索引（包含）
+        end_idx: 结束K线索引（包含）
+        pivot_window: 左右各几根K线确认
+    """
+    # 取范围内的数据
+    sub = df.iloc[start_idx:end_idx + 1].copy().reset_index(drop=True)
     n = len(sub)
     w = pivot_window
-    swing_highs, swing_lows = [], []
-
+    swing_highs = []
+    swing_lows = []
+    
+    if n < w * 2 + 1:
+        return swing_highs, swing_lows
+    
     for i in range(w, n - w):
         h = sub.iloc[i]["high"]
         l = sub.iloc[i]["low"]
-        orig_idx = start + i
-
+        orig_idx = start_idx + i
+        
+        # 摆动高点：左右各 w 根K线的高点都低于当前
         left_higher = all(sub.iloc[i - j]["high"] < h for j in range(1, w + 1))
         right_higher = all(sub.iloc[i + j]["high"] < h for j in range(1, w + 1))
         if left_higher and right_higher:
             swing_highs.append({"idx": orig_idx, "price": h})
-
+        
+        # 摆动低点：左右各 w 根K线的低点都高于当前
         left_lower = all(sub.iloc[i - j]["low"] > l for j in range(1, w + 1))
         right_lower = all(sub.iloc[i + j]["low"] > l for j in range(1, w + 1))
         if left_lower and right_lower:
             swing_lows.append({"idx": orig_idx, "price": l})
-
+    
     return swing_highs, swing_lows
 
 
-def detect_trend(swing_highs, swing_lows):
-    if len(swing_highs) < 3 or len(swing_lows) < 3:
-        return "数据不足（需要至少3个摆动高点+3个摆动低点）"
-
-    h = swing_highs[-3:]
-    l = swing_lows[-3:]
-
-    hh_count = (1 if h[1]["price"] > h[0]["price"] else 0) + (1 if h[2]["price"] > h[1]["price"] else 0)
-    hl_count = (1 if l[1]["price"] > l[0]["price"] else 0) + (1 if l[2]["price"] > l[1]["price"] else 0)
-    lh_count = (1 if h[1]["price"] < h[0]["price"] else 0) + (1 if h[2]["price"] < h[1]["price"] else 0)
-    ll_count = (1 if l[1]["price"] < l[0]["price"] else 0) + (1 if l[2]["price"] < l[1]["price"] else 0)
-
-    if hh_count >= 2 and hl_count >= 2:
-        return "上升趋势"
-    elif lh_count >= 2 and ll_count >= 2:
-        return "下降趋势"
+def detect_trend_from_swings(swing_highs, swing_lows):
+    """根据摆动点判断趋势"""
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "趋势判断需要更多摆动点（当前高点:{}个，低点:{}个）".format(len(swing_highs), len(swing_lows))
+    
+    # 取最近2个高点判断方向
+    recent_highs = swing_highs[-2:]
+    recent_lows = swing_lows[-2:]
+    
+    higher_high = recent_highs[1]["price"] > recent_highs[0]["price"] if len(recent_highs) == 2 else False
+    higher_low = recent_lows[1]["price"] > recent_lows[0]["price"] if len(recent_lows) == 2 else False
+    lower_high = recent_highs[1]["price"] < recent_highs[0]["price"] if len(recent_highs) == 2 else False
+    lower_low = recent_lows[1]["price"] < recent_lows[0]["price"] if len(recent_lows) == 2 else False
+    
+    if higher_high and higher_low:
+        return "上升趋势（更高高点+更高低点）"
+    elif lower_high and lower_low:
+        return "下降趋势（更低高点+更低低点）"
+    elif higher_high and lower_low:
+        return "扩展震荡（更高高点+更低低点）"
+    elif lower_high and higher_low:
+        return "收缩震荡（更低高点+更高低点）"
     else:
-        return "横盘震荡"
+        return "横盘震荡（无明显方向）"
 
 
-def detect_bar_patterns(df, bar, lookback=50):
-    """识别K线形态"""
-    start = max(0, bar - lookback)
-    sub = df.iloc[start:bar + 1].copy().reset_index(drop=True)
+def detect_bar_patterns_in_range(df, start_idx, end_idx, lookback=50):
+    """在指定K线范围内识别K线形态"""
+    # 确保不超出范围
+    actual_start = max(start_idx, end_idx - lookback)
+    sub = df.iloc[actual_start:end_idx + 1].copy().reset_index(drop=True)
     n = len(sub)
     patterns = []
 
     for i in range(1, n):
         prev = sub.iloc[i - 1]
         curr = sub.iloc[i]
-        orig_idx = start + i
+        orig_idx = actual_start + i
         ph, pl = prev["high"], prev["low"]
         ch, cl = curr["high"], curr["low"]
         co, cc = curr["open"], curr["close"]
@@ -220,7 +240,7 @@ def detect_bar_patterns(df, bar, lookback=50):
             break
     if streak >= 3:
         direction = "多头" if streak_dir else "空头"
-        patterns.append(f"最近{streak}根连续强势{direction}K线（无明显重叠，截至K{bar}）")
+        patterns.append(f"最近{streak}根连续强势{direction}K线（无明显重叠，截至K{end_idx}）")
 
     # IOI模式
     for i in range(2, n):
@@ -229,17 +249,18 @@ def detect_bar_patterns(df, bar, lookback=50):
         k3 = sub.iloc[i]
         if (k2["high"] < k1["high"] and k2["low"] > k1["low"]) and \
            (k3["high"] > k2["high"] and k3["low"] < k2["low"]):
-            patterns.append(f"K{start+i-2}-K{start+i}: IOI模式")
+            patterns.append(f"K{actual_start+i-2}-K{actual_start+i}: IOI模式")
 
     return patterns[-20:]
 
 
-def detect_double_top_bottom(swing_highs, swing_lows):
+def detect_double_top_bottom_in_range(swing_highs, swing_lows):
+    """识别双顶和双底"""
     results = []
     if len(swing_highs) >= 2:
         h1, h2 = swing_highs[-2], swing_highs[-1]
         diff_pct = abs(h2["price"] - h1["price"]) / h1["price"] if h1["price"] > 0 else 1
-        if diff_pct < 0.015:
+        if diff_pct < 0.02:
             if h2["price"] > h1["price"]:
                 label = "更高高点"
             elif h2["price"] < h1["price"]:
@@ -251,7 +272,7 @@ def detect_double_top_bottom(swing_highs, swing_lows):
     if len(swing_lows) >= 2:
         l1, l2 = swing_lows[-2], swing_lows[-1]
         diff_pct = abs(l2["price"] - l1["price"]) / l1["price"] if l1["price"] > 0 else 1
-        if diff_pct < 0.015:
+        if diff_pct < 0.02:
             if l2["price"] > l1["price"]:
                 label = "更高低点"
             elif l2["price"] < l1["price"]:
@@ -264,17 +285,28 @@ def detect_double_top_bottom(swing_highs, swing_lows):
 
 
 def build_structure_report(df, bar):
-    """生成完整结构分析报告"""
-    swing_highs, swing_lows = find_swing_points(df, lookback=80)
-    swing_highs = [s for s in swing_highs if s["idx"] <= bar]
-    swing_lows = [s for s in swing_lows if s["idx"] <= bar]
-
-    trend = detect_trend(swing_highs, swing_lows)
-    bar_patterns = detect_bar_patterns(df, bar, lookback=50)
-    double_patterns = detect_double_top_bottom(swing_highs, swing_lows)
-
-    start = max(0, bar - 60)
-    sub = df.iloc[start:bar + 1]
+    """
+    生成完整结构分析报告
+    分析范围：与用户看到的图表范围一致（最近80根K线）
+    """
+    # 图表显示范围：最近80根K线（从 bar-79 到 bar）
+    chart_start = max(0, bar - 79)
+    
+    # 在图表范围内识别摆动点
+    swing_highs, swing_lows = find_swing_points_in_range(df, chart_start, bar, pivot_window=2)
+    
+    # 趋势判断
+    trend = detect_trend_from_swings(swing_highs, swing_lows)
+    
+    # K线形态识别（在图表范围内）
+    bar_patterns = detect_bar_patterns_in_range(df, chart_start, bar, lookback=50)
+    
+    # 双顶/双底检测
+    double_patterns = detect_double_top_bottom_in_range(swing_highs, swing_lows)
+    
+    # 计算最近60根K线区间（在图表范围内）
+    range_start = max(chart_start, bar - 59)
+    sub = df.iloc[range_start:bar + 1]
     price_range_high = float(sub["high"].max())
     price_range_low = float(sub["low"].min())
     current = df.iloc[bar]
@@ -282,7 +314,8 @@ def build_structure_report(df, bar):
     lines = [
         "═══════ 结构分析报告 ═══════",
         f"当前K线: K{bar} | O={float(current['open']):.0f} H={float(current['high']):.0f} L={float(current['low']):.0f} C={float(current['close']):.0f}",
-        f"60根K线区间: {price_range_low:.0f} ~ {price_range_high:.0f}",
+        f"分析范围: K{chart_start} ~ K{bar}（共{bar - chart_start + 1}根K线）",
+        f"最近60根K线区间: {price_range_low:.0f} ~ {price_range_high:.0f}",
         "",
         "【趋势判断】",
         trend,
@@ -553,6 +586,16 @@ def reset_step_progress():
     st.session_state.round_count = {i: 0 for i in range(1, 6)}
 
 
+def update_swings_and_report(df, bar):
+    """更新摆动点和结构报告（与图表范围对齐）"""
+    chart_start = max(0, bar - 79)
+    swing_highs, swing_lows = find_swing_points_in_range(df, chart_start, bar, pivot_window=2)
+    # 只保留图表范围内的摆动点
+    st.session_state.swing_highs = [s for s in swing_highs if chart_start <= s["idx"] <= bar]
+    st.session_state.swing_lows = [s for s in swing_lows if chart_start <= s["idx"] <= bar]
+    st.session_state.structure_report = build_structure_report(df, bar)
+
+
 def load_new_symbol(code, period_value):
     with st.spinner(f"加载 {code} {period_value}分钟..."):
         df = load_data(f"{code}0", period=period_value)
@@ -560,13 +603,10 @@ def load_new_symbol(code, period_value):
             st.error(f"{code} 数据加载失败")
             return False
         bar = random.randint(80, len(df) - 20)
-        sh, sl = find_swing_points(df, lookback=80)
         st.session_state.df = df
         st.session_state.symbol = code
         st.session_state.current_bar = bar
-        st.session_state.swing_highs = sh
-        st.session_state.swing_lows = sl
-        st.session_state.structure_report = build_structure_report(df, bar)
+        update_swings_and_report(df, bar)
         reset_step_progress()
         st.session_state.practice_start_time = time.time()
         return True
@@ -579,7 +619,6 @@ def calculate_step_score(user_answer, core_elements):
     total = len(core_elements)
     user_answer_lower = user_answer.lower()
     for element in core_elements:
-        # 提取关键词（取前几个中文字符作为匹配依据）
         keywords = element.split("：")[0].strip() if "：" in element else element.split(":")[0].strip()
         if keywords in user_answer or any(k in user_answer_lower for k in keywords.split("、")[:2]):
             score += 1
@@ -674,10 +713,7 @@ def main():
             )
             if new_bar != st.session_state.current_bar:
                 st.session_state.current_bar = new_bar
-                sh, sl = find_swing_points(df, lookback=80)
-                st.session_state.swing_highs = sh
-                st.session_state.swing_lows = sl
-                st.session_state.structure_report = build_structure_report(df, new_bar)
+                update_swings_and_report(df, new_bar)
                 reset_step_progress()
                 st.session_state.practice_start_time = time.time()
                 st.rerun()
@@ -686,10 +722,7 @@ def main():
             if col1.button("🎲 随机", use_container_width=True):
                 new_bar = random.randint(80, max_bar - 20)
                 st.session_state.current_bar = new_bar
-                sh, sl = find_swing_points(df, lookback=80)
-                st.session_state.swing_highs = sh
-                st.session_state.swing_lows = sl
-                st.session_state.structure_report = build_structure_report(df, new_bar)
+                update_swings_and_report(df, new_bar)
                 reset_step_progress()
                 st.session_state.practice_start_time = time.time()
                 st.rerun()
@@ -710,7 +743,8 @@ def main():
         这不是考试，这是练习。目标是**每天按固定流程复盘**，形成习惯。
         
         - **第1步**：画线 - 找到通道、楔形、超出(Overshoot)
-        - **第2步**：形态 - 识别双顶/双底、三角形等        - **第3步**：特殊K线 - 找到IB、OB、IOI、大K线、连续强势K线
+        - **第2步**：形态 - 识别双顶/双底、三角形等
+        - **第3步**：特殊K线 - 找到IB、OB、IOI、大K线、连续强势K线
         - **第4步**：入场点 - 标记入场K线、方向、价格
         - **第5步**：交易管理 - 止损、目标、仓位、概率、退出条件
         
@@ -765,10 +799,7 @@ def main():
         if st.button("🔄 开始下一次复盘", type="primary"):
             new_bar = random.randint(80, len(df) - 20)
             st.session_state.current_bar = new_bar
-            sh, sl = find_swing_points(df, lookback=80)
-            st.session_state.swing_highs = sh
-            st.session_state.swing_lows = sl
-            st.session_state.structure_report = build_structure_report(df, new_bar)
+            update_swings_and_report(df, new_bar)
             reset_step_progress()
             st.session_state.practice_start_time = time.time()
             st.rerun()

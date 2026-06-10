@@ -1,6 +1,7 @@
 """
-Al Brooks 日内机会寻找训练器 V5.0（稳定版）
+Al Brooks 日内机会寻找训练器 V5.0（完整版）
 核心设计：一次性分析80根K线，输出完整故事
+每根K线都有编号，用户可以精确引用
 """
 
 import streamlit as st
@@ -36,29 +37,33 @@ EXCHANGES = {
 
 # 五步框架
 FIVE_STEPS = [
-    {"name": "第1步：画线", "question": "画出通道和楔形。请说明你的画法和理由。"},
-    {"name": "第2步：形态", "question": "识别双顶/双底、三角形等形态。你看到了什么？"},
-    {"name": "第3步：特殊K线", "question": "有哪些特殊K线（大K线、内包、外包、IOI等）？"},
-    {"name": "第4步：值得做吗", "question": "这笔交易值得做吗？概率、空间、风险如何？"},
-    {"name": "第5步：管理仓位", "question": "如果入场，如何管理？止损、目标、退出条件？"},
+    {"name": "第1步：画线", "question": "画出通道和楔形。请引用具体K线编号说明你的画法和理由。"},
+    {"name": "第2步：形态", "question": "识别双顶/双底、三角形等形态。请引用具体K线编号说明你看到了什么。"},
+    {"name": "第3步：特殊K线", "question": "有哪些特殊K线（大K线、内包、外包、IOI等）？请引用具体K线编号。"},
+    {"name": "第4步：值得做吗", "question": "这笔交易值得做吗？概率、空间、风险如何？请引用具体K线位置。"},
+    {"name": "第5步：管理仓位", "question": "如果入场，如何管理？止损、目标、退出条件？请引用具体价格和K线。"},
 ]
 
 # ==================== AI 提示词 ====================
 STORY_ANALYSIS_SYSTEM = """你是 Al Brooks 价格行为教练。
+
+【重要】用户看到的图表上，每根K线都有编号（K0, K1, K2...K79）。
+用户必须引用具体的K线编号来说明他的观察。
 
 【你的任务】
 用户已经看到了完整的80根K线图表。
 他正在按照五步框架，一次性分析整张图。
 你的任务是：
 1. 验证用户的故事是否完整
-2. 追问遗漏的关键证据
-3. 追问反证："什么情况会证明你的判断是错的？"
+2. 检查用户是否引用了具体的K线编号
+3. 追问遗漏的关键证据
+4. 追问反证："什么情况会证明你的判断是错的？"
 
 【输出格式】
 - 先说肯定的话（"好的，我理解了"）
+- 如果用户没有引用K线编号，请提醒他引用
 - 然后问2-3个引导性问题
 - 控制在150字以内
-- 语气平和，像教练一样引导
 
 【图表信息】
 K线范围: K0 ~ K{max_bar}（共{count}根K线）
@@ -99,7 +104,6 @@ def call_story_analyzer(df, max_bar, user_story, conversation_history):
         {"role": "user", "content": f"用户的五步分析：\n{user_story}"}
     ]
     
-    # 添加历史对话（确保格式正确）
     for msg in conversation_history[-6:]:
         if isinstance(msg, dict) and "role" in msg and "content" in msg:
             messages.append(msg)
@@ -133,10 +137,11 @@ def load_data(symbol, period="30"):
 
 # ==================== 图表绘制 ====================
 def build_chart(df, max_bar):
-    """绘制完整K线图"""
+    """绘制完整K线图，每根K线都有编号"""
     start = max(0, max_bar - 80)
     plot_df = df.iloc[start:max_bar+1].copy().reset_index(drop=True)
     original_indices = list(range(start, max_bar+1))
+    n_bars = len(original_indices)
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
@@ -159,27 +164,69 @@ def build_chart(df, max_bar):
         marker_color=vol_colors, showlegend=False, opacity=0.5
     ), row=2, col=1)
 
-    # 标记K线编号（每10根标一个）
+    # ========== 关键修改：每根K线都标注编号 ==========
+    # 每根K线都标注，但字号小一些，颜色淡一些
     for idx, orig_idx in enumerate(original_indices):
-        if orig_idx % 10 == 0:
+        row_data = plot_df.iloc[idx]
+        # 根据K线方向决定标注位置（阳线在下方，阴线在上方）
+        if row_data["close"] >= row_data["open"]:
+            # 阳线：编号标在K线下方
+            y_pos = row_data["low"]
+            y_shift = -12
+        else:
+            # 阴线：编号标在K线上方
+            y_pos = row_data["high"]
+            y_shift = 12
+        
+        fig.add_annotation(
+            x=idx, y=y_pos,
+            text=str(orig_idx),
+            showarrow=False,
+            font=dict(size=8, color="#666666"),
+            yshift=y_shift,
+            row=1, col=1
+        )
+    
+    # 每隔10根K线用更大的字体突出显示
+    for idx, orig_idx in enumerate(original_indices):
+        if orig_idx % 10 == 0 and orig_idx != 0:
             row_data = plot_df.iloc[idx]
+            if row_data["close"] >= row_data["open"]:
+                y_pos = row_data["low"]
+                y_shift = -20
+            else:
+                y_pos = row_data["high"]
+                y_shift = 20
             fig.add_annotation(
-                x=idx, y=row_data["low"],
-                text=str(orig_idx), showarrow=False,
-                font=dict(size=7, color="#888888"),
-                yshift=-14, row=1, col=1
+                x=idx, y=y_pos,
+                text=f"★ {orig_idx}",
+                showarrow=False,
+                font=dict(size=10, color="#333333", weight="bold"),
+                yshift=y_shift,
+                row=1, col=1
             )
 
     fig.update_layout(
         xaxis_rangeslider_visible=False,
-        height=500,
-        margin=dict(l=5, r=5, t=5, b=5),
+        height=550,
+        margin=dict(l=10, r=10, t=10, b=10),
         paper_bgcolor="#ffffff",
         plot_bgcolor="#f8f9fa",
         font=dict(color="#212529"),
     )
     fig.update_xaxes(showgrid=True, gridcolor="#e9ecef", gridwidth=0.5)
     fig.update_yaxes(showgrid=True, gridcolor="#e9ecef", gridwidth=0.5)
+    
+    # 添加说明文字
+    fig.add_annotation(
+        x=0.01, y=0.99, xref="paper", yref="paper",
+        text="📌 每根K线上方/下方都有编号（K0, K1, K2...）| ★标注每10根",
+        showarrow=False,
+        font=dict(size=10, color="#888888"),
+        bgcolor="rgba(255,255,255,0.8)",
+        borderpad=2
+    )
+    
     return fig
 
 
@@ -189,7 +236,7 @@ def init_state():
         "df": None,
         "symbol": None,
         "max_bar": 80,
-        "conversations": [],  # 存储 {"role": "user"/"assistant", "content": "..."}
+        "conversations": [],
         "analysis_complete": False,
         "practice_count": 0,
     }
@@ -210,7 +257,7 @@ def load_new_symbol(code, period_value):
             st.error(f"{code} 数据加载失败")
             return False
         
-        # 设置最大K线索引（显示最近80根，但确保不超过数据长度）
+        # 显示最近80根K线
         max_bar = min(80, len(df) - 1)
         
         st.session_state.df = df
@@ -252,6 +299,7 @@ def main():
         st.markdown("---")
         st.markdown("**训练理念**")
         st.caption("一次性加载80根K线，一次性完成五步分析")
+        st.caption("每根K线都有编号，分析时必须引用具体K线")
         st.caption("AI追问证据和反证，训练完整的故事阅读能力")
         
         st.markdown("---")
@@ -287,9 +335,9 @@ def main():
         <p><strong>一次性分析80根K线，输出完整故事。</strong></p>
         <p>训练流程：</p>
         <ol>
-            <li>加载80根K线图表</li>
-            <li>按照五步框架，一次性分析整张图</li>
-            <li>AI追问：什么证据支持？什么证据反对？</li>
+            <li>加载80根K线图表（每根K线都有编号K0, K1, K2...）</li>
+            <li>按照五步框架，一次性分析整张图，<strong>必须引用具体K线编号</strong></li>
+            <li>AI会检查你是否引用了K线编号，并追问证据和反证</li>
             <li>完成分析后，系统记录一次完整复盘</li>
         </ol>
         <p style="color:#6c757d;">💡 五步框架：画线 → 形态 → 特殊K线 → 值得做吗 → 管理仓位</p>
@@ -310,10 +358,9 @@ def main():
             st.caption(step['question'])
             st.markdown("---")
 
-    # 对话区域（安全显示）
+    # 对话区域
     conv = st.session_state.conversations
     
-    # 确保 conv 中的每条消息都有正确的格式
     for msg in conv:
         if isinstance(msg, dict) and "role" in msg and "content" in msg:
             with st.chat_message(msg["role"]):
@@ -340,20 +387,21 @@ def main():
         return
 
     # 等待用户输入
-    user_input = st.chat_input("请按照五步框架，描述你对这张图的分析...")
+    st.markdown("### ✏️ 你的分析")
+    st.caption("请按照五步框架，引用具体K线编号（如K15、K32）描述你的观察")
+    
+    user_input = st.chat_input("例如：K5-K15形成下降通道，K28是双底右底...")
 
     if user_input:
-        # 添加用户消息
         conv.append({"role": "user", "content": user_input})
         
         with st.spinner("AI分析中..."):
             ai_response = call_story_analyzer(df, max_bar, user_input, conv)
         
-        # 添加AI回复
         conv.append({"role": "assistant", "content": ai_response})
         
-        # 简单判断：如果用户输入超过150字，视为完成分析
-        if len(user_input) > 150:
+        # 简单判断：如果用户输入超过150字且包含"K"（引用了编号），视为完成
+        if len(user_input) > 150 and ("K" in user_input or "k" in user_input):
             st.session_state.analysis_complete = True
         
         st.rerun()

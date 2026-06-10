@@ -23,7 +23,33 @@ import random
 import time
 import re
 from collections import deque
-from sklearn.linear_model import LinearRegression
+
+# ==================== 简单线性回归（纯 NumPy，无 sklearn 依赖）====================
+def simple_linear_regression(x, y):
+    """简单线性回归，返回斜率和 R²"""
+    n = len(x)
+    if n < 2:
+        return 0, 0
+    
+    x_mean = sum(x) / n
+    y_mean = sum(y) / n
+    
+    numerator = sum((x[i] - x_mean) * (y[i] - y_mean) for i in range(n))
+    denominator = sum((x[i] - x_mean) ** 2 for i in range(n))
+    
+    if denominator == 0:
+        return 0, 0
+    
+    slope = numerator / denominator
+    
+    # 计算 R²
+    ss_res = sum((y[i] - (slope * x[i] + (y_mean - slope * x_mean))) ** 2 for i in range(n))
+    ss_tot = sum((y[i] - y_mean) ** 2 for i in range(n))
+    
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    
+    return slope, r2
+
 
 # ==================== 配置 ====================
 SYMBOL_NAMES = {
@@ -165,12 +191,12 @@ class StructureAnalyzer:
         lows = self.swing_lows[-3:]
         
         if len(highs) >= 2:
-            high_slope = (highs[-1]["price"] - highs[-2]["price"]) / (highs[-1]["idx"] - highs[-2]["idx"]) if highs[-1]["idx"] != highs[-2]["idx"] else 0
+            high_slope = (highs[-1]["price"] - highs[-2]["price"]) / max(1, highs[-1]["idx"] - highs[-2]["idx"])
         else:
             high_slope = 0
         
         if len(lows) >= 2:
-            low_slope = (lows[-1]["price"] - lows[-2]["price"]) / (lows[-1]["idx"] - lows[-2]["idx"]) if lows[-1]["idx"] != lows[-2]["idx"] else 0
+            low_slope = (lows[-1]["price"] - lows[-2]["price"]) / max(1, lows[-1]["idx"] - lows[-2]["idx"])
         else:
             low_slope = 0
         
@@ -185,35 +211,22 @@ class StructureAnalyzer:
     
     def detect_wedge(self):
         """检测楔形（3个以上同向接触点）"""
+        wedge_detected = False
+        
         if len(self.swing_highs) >= 3:
-            x_highs = [[h["idx"]] for h in self.swing_highs[-3:]]
-            y_highs = [h["price"] for h in self.swing_highs[-3:]]
-            if len(x_highs) >= 2:
-                try:
-                    reg = LinearRegression().fit(x_highs, y_highs)
-                    r2_high = reg.score(x_highs, y_highs)
-                except:
-                    r2_high = 0
-            else:
-                r2_high = 0
-        else:
-            r2_high = 0
+            x = [h["idx"] for h in self.swing_highs[-3:]]
+            y = [h["price"] for h in self.swing_highs[-3:]]
+            slope, r2 = simple_linear_regression(x, y)
+            if r2 > 0.9:
+                wedge_detected = True
         
-        if len(self.swing_lows) >= 3:
-            x_lows = [[l["idx"]] for l in self.swing_lows[-3:]]
-            y_lows = [l["price"] for l in self.swing_lows[-3:]]
-            if len(x_lows) >= 2:
-                try:
-                    reg = LinearRegression().fit(x_lows, y_lows)
-                    r2_low = reg.score(x_lows, y_lows)
-                except:
-                    r2_low = 0
-            else:
-                r2_low = 0
-        else:
-            r2_low = 0
+        if not wedge_detected and len(self.swing_lows) >= 3:
+            x = [l["idx"] for l in self.swing_lows[-3:]]
+            y = [l["price"] for l in self.swing_lows[-3:]]
+            slope, r2 = simple_linear_regression(x, y)
+            if r2 > 0.9:
+                wedge_detected = True
         
-        wedge_detected = (r2_high > 0.9 and len(self.swing_highs) >= 3) or (r2_low > 0.9 and len(self.swing_lows) >= 3)
         return wedge_detected
     
     def detect_double_top_bottom(self):
@@ -557,8 +570,12 @@ def calculate_coverage(user_answer, detected_elements):
         "楔形": ["楔形", "wedge"],
         "双顶": ["双顶", "double top"],
         "双底": ["双底", "double bottom"],
+        "更高高点双顶": ["双顶", "double top"],
+        "更高低点双底": ["双底", "double bottom"],
         "三角形": ["三角形", "triangle"],
         "推进波": ["推", "push"],
+        "2推": ["推", "push"],
+        "3推": ["推", "push"],
         "大K线": ["大阳", "大阴", "大k"],
         "惊讶K线": ["惊讶", "surprise"],
         "IB": ["内包", "ib"],
@@ -802,7 +819,7 @@ def main():
             for step_key, weaknesses in st.session_state.reading_profile.items():
                 for w, count in weaknesses.items():
                     if count >= 2:
-                        st.markdown(f"⚠️ {STEPS[int(step_key)]['name']}: {w[:12]}… ×{count}")
+                        st.markdown(f"⚠️ 第{step_key}步：{w[:12]}… ×{count}")
         else:
             st.caption("暂无")
         

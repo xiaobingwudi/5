@@ -1,15 +1,15 @@
 """
-Al Brooks 日内机会寻找训练器 V12.0
+Al Brooks 日内机会寻找训练器 V12.1
 核心理念：观察市场 → 描述行为 → 形成观点 → 验证
 
 训练流程：
-1. 观察最近20-40根K线
+1. 观察最近30根K线
 2. 回答三个问题：
    - 市场在做什么？（描述你看到的行为）
    - 你判断的依据是什么？（引用具体K线编号）
    - 如果判断错误，会出现什么信号？
 3. AI挑战你的观察，但不是判断对错
-4. 推进K线，验证你的判断
+4. 推进10根新K线，验证你的判断
 """
 
 import streamlit as st
@@ -60,19 +60,18 @@ def load_futures_data(symbol, period):
         return None
 
 
-# ==================== 图表绘制（每根K线都有编号，从1开始）====================
+# ==================== 图表绘制（白色背景，每根K线都有编号）====================
 def build_chart(df, current_pos=None, highlight_range=None):
     """
-    绘制K线图
+    绘制K线图 - 白色背景
     - 每根K线都有编号（K1, K2, K3...）
     - 编号显示在K线下方（阳线）或上方（阴线）
     """
-    # 取最近的数据进行显示
     start = max(0, len(df) - 80)
     plot_df = df.iloc[start:].copy().reset_index(drop=True)
     n_bars = len(plot_df)
     
-    # 编号从1开始（K1, K2, K3...）
+    # 编号从1开始
     bar_numbers = list(range(start + 1, start + n_bars + 1))
 
     fig = make_subplots(
@@ -80,7 +79,7 @@ def build_chart(df, current_pos=None, highlight_range=None):
         vertical_spacing=0.02, row_heights=[0.75, 0.25]
     )
 
-    # K线
+    # K线（红色阳线，绿色阴线，更符合国内习惯）
     fig.add_trace(go.Candlestick(
         x=plot_df.index,
         open=plot_df['open'], high=plot_df['high'],
@@ -105,7 +104,7 @@ def build_chart(df, current_pos=None, highlight_range=None):
             x=idx, y=y_pos,
             text=f"K{bar_num}",
             showarrow=False,
-            font=dict(size=8, color="#888888"),
+            font=dict(size=8, color="#666666"),
             yshift=y_shift,
             row=1, col=1
         )
@@ -166,12 +165,12 @@ def build_chart(df, current_pos=None, highlight_range=None):
         xaxis_rangeslider_visible=False,
         height=520,
         margin=dict(l=10, r=10, t=30, b=10),
-        paper_bgcolor="#0d1117",
-        plot_bgcolor="#0d1117",
-        font=dict(color="#c9d1d9"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#f8f9fa",
+        font=dict(color="#333333"),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#21262d", gridwidth=0.5, showticklabels=False)
-    fig.update_yaxes(showgrid=True, gridcolor="#21262d", gridwidth=0.5)
+    fig.update_xaxes(showgrid=True, gridcolor="#e0e0e0", gridwidth=0.5, showticklabels=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#e0e0e0", gridwidth=0.5)
 
     return fig
 
@@ -288,18 +287,16 @@ def init_state():
         "df": None,
         "symbol": None,
         "period": "15",
-        # 训练状态
-        "phase": "select",           # select / observe / challenge / verify / complete
-        "current_pos": 30,           # 当前观察到的K线位置
-        "observation_start": 1,      # 观察起始K线编号
-        "observation_end": 30,       # 观察结束K线编号
-        "user_observation": "",      # 用户的市场观察
-        "user_evidence": "",         # 用户依据
-        "user_fail_signal": "",      # 用户认为什么会证明他错了
-        "ai_challenge": "",          # AI挑战内容
-        "verification_result": "",   # 验证结果
-        "verification_start": 0,     # 验证起始位置
-        # 统计
+        "phase": "select",
+        "current_pos": 30,
+        "observation_start": 1,
+        "observation_end": 30,
+        "user_observation": "",
+        "user_evidence": "",
+        "user_fail_signal": "",
+        "ai_challenge": "",
+        "verification_result": "",
+        "verification_start": 0,
         "practice_count": 0,
         "history": [],
         "current_practice_start": None,
@@ -334,43 +331,52 @@ def load_symbol(code, period):
     return True
 
 
-# ==================== 主界面 ====================
+# ==================== 主界面（白色背景）====================
 def main():
     st.set_page_config(page_title="Al Brooks 读盘训练器", layout="wide")
     
+    # 白色背景CSS
     st.markdown("""
     <style>
-    .stApp { background-color: #0d1117; }
-    [data-testid="stSidebar"] { background-color: #161b22 !important; border-right: 1px solid #30363d; }
-    h1, h2, h3 { color: #e6edf3; }
+    .stApp { background-color: #ffffff; }
+    [data-testid="stSidebar"] {
+        background-color: #f5f5f5 !important;
+        border-right: 1px solid #e0e0e0;
+    }
+    h1, h2, h3, p, .stMarkdown {
+        color: #333333 !important;
+    }
     .stButton > button {
-        background: #21262d;
-        border: 1px solid #30363d;
-        color: #c9d1d9;
+        background: #f0f0f0;
+        border: 1px solid #cccccc;
+        color: #333333;
         border-radius: 6px;
     }
     .stButton > button:hover {
-        background: #388bfd;
-        border-color: #388bfd;
-        color: white;
+        background: #e0e0e0;
+        border-color: #999999;
+        color: #333333;
     }
     .stTextArea textarea {
-        background-color: #161b22;
-        border-color: #30363d;
-        color: #c9d1d9;
+        background-color: #fafafa;
+        border-color: #dddddd;
+        color: #333333;
     }
     .stTextArea textarea:focus {
-        border-color: #388bfd;
+        border-color: #4caf50;
+    }
+    .stProgress > div > div {
+        background-color: #4caf50;
     }
     .info-box {
-        background: #161b22;
-        border: 1px solid #30363d;
+        background: #f8f9fa;
+        border: 1px solid #e0e0e0;
         border-radius: 8px;
         padding: 16px;
         margin: 12px 0;
     }
     .info-box-title {
-        color: #58a6ff;
+        color: #4caf50;
         font-size: 13px;
         font-weight: 600;
         margin-bottom: 8px;
@@ -380,7 +386,7 @@ def main():
 
     init_state()
 
-    # ========== 侧边栏 ==========
+    # 侧边栏（白色/浅灰色）
     with st.sidebar:
         st.markdown("## 📊 Al Brooks 读盘训练器")
         st.markdown("---")
@@ -413,15 +419,15 @@ def main():
         
         st.markdown("---")
         st.markdown(f"**训练次数**")
-        st.markdown(f"<div style='font-size:28px;font-weight:600;color:#58a6ff;'>{st.session_state.practice_count}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:28px;font-weight:600;color:#4caf50;'>{st.session_state.practice_count}</div>", unsafe_allow_html=True)
 
-    # ========== 选择品种页面 ==========
+    # 选择品种页面
     if st.session_state.df is None:
         st.markdown("## 👈 从左侧选择品种开始训练")
         st.markdown("""
         <div class="info-box">
             <div class="info-box-title">📖 训练流程</div>
-            <div style="color:#c9d1d9;line-height:1.8;">
+            <div style="color:#333333;line-height:1.8;">
                 1. 观察最近30根K线<br>
                 2. 回答三个问题：
                    - 市场在做什么？（描述你看到的行为）<br>
@@ -439,7 +445,7 @@ def main():
     period_label = PERIOD_LABELS[st.session_state.period]
     symbol = st.session_state.symbol
 
-    # ========== 训练完成 ==========
+    # 训练完成
     if st.session_state.phase == "complete":
         st.success("🎉 完成一次读盘训练！")
         
@@ -447,7 +453,6 @@ def main():
         with col1:
             if st.button("🔄 继续训练", type="primary"):
                 st.session_state.practice_count += 1
-                # 随机偏移K线位置
                 max_pos = len(df) - 10
                 new_pos = random.randint(40, min(60, max_pos))
                 st.session_state.current_pos = new_pos
@@ -463,9 +468,8 @@ def main():
                     st.rerun()
         return
 
-    # ========== 观察阶段 ==========
+    # 观察阶段
     if st.session_state.phase == "observe":
-        # 显示图表
         st.plotly_chart(
             build_chart(
                 df,
@@ -475,7 +479,6 @@ def main():
             use_container_width=True
         )
         
-        # 进度显示
         st.progress(
             st.session_state.current_pos / len(df),
             text=f"当前观察到了 K{st.session_state.current_pos} / 共{len(df)}根K线"
@@ -485,21 +488,18 @@ def main():
         st.markdown("请回答以下三个问题：")
         
         with st.form(key="observation_form"):
-            # 问题1：市场在做什么？
             observation = st.text_area(
                 "① 市场在做什么？",
                 placeholder="例如：空头在控制，连续出现阴线，反弹很弱...",
                 height=80
             )
             
-            # 问题2：依据是什么？
             evidence = st.text_area(
                 "② 你的判断依据是什么？（请引用具体的K线编号）",
                 placeholder="例如：K15-K20连续5根阴线；K22反弹失败；K25收盘新低...",
                 height=80
             )
             
-            # 问题3：什么信号会证明你错了？
             fail_signal = st.text_area(
                 "③ 如果判断错误，会出现什么信号？",
                 placeholder="例如：如果出现连续两根阳线收盘在K22高点上方，我会重新评估...",
@@ -526,9 +526,8 @@ def main():
                 else:
                     st.warning("请至少填写前两个问题")
 
-    # ========== AI挑战阶段 ==========
+    # AI挑战阶段
     elif st.session_state.phase == "challenge":
-        # 显示图表
         st.plotly_chart(
             build_chart(
                 df,
@@ -540,18 +539,15 @@ def main():
         
         st.markdown(f"### 🤖 AI教练挑战")
         
-        # 显示用户的观察
         with st.expander("📋 你的观察", expanded=True):
             st.markdown(f"**市场行为：** {st.session_state.user_observation}")
             st.markdown(f"**判断依据：** {st.session_state.user_evidence}")
             if st.session_state.user_fail_signal:
                 st.markdown(f"**反证信号：** {st.session_state.user_fail_signal}")
         
-        # 显示AI挑战
         with st.chat_message("assistant"):
             st.markdown(st.session_state.ai_challenge)
         
-        # 用户可以选择修改或继续
         col1, col2 = st.columns(2)
         with col1:
             if st.button("✏️ 修改观察", use_container_width=True):
@@ -563,12 +559,10 @@ def main():
                 st.session_state.phase = "verify"
                 st.rerun()
 
-    # ========== 验证阶段 ==========
+    # 验证阶段
     elif st.session_state.phase == "verify":
-        # 推进10根K线
         new_pos = min(st.session_state.current_pos + 10, len(df))
         
-        # 显示图表（包含新K线）
         st.plotly_chart(
             build_chart(
                 df,
@@ -583,7 +577,6 @@ def main():
         st.markdown(f"### 🔍 验证阶段：K{st.session_state.current_pos+1} → K{new_pos}")
         st.markdown("新出现的K线是否改变了你的判断？")
         
-        # 显示新K线的简要描述
         new_bars_text = ""
         for i in range(st.session_state.current_pos, new_pos):
             row = df.iloc[i]
@@ -594,11 +587,9 @@ def main():
         with st.expander("📊 新K线详情", expanded=True):
             st.text(new_bars_text)
         
-        # 显示之前的反证信号
         if st.session_state.user_fail_signal:
             st.info(f"💡 你之前设定的反证信号：{st.session_state.user_fail_signal}")
         
-        # 用户验证
         verification = st.text_area(
             "新出现的K线是否改变了你的判断？请说明原因。",
             placeholder="例如：没有改变，空头仍然控制，因为反弹很弱...",

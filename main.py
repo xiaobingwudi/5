@@ -1,15 +1,6 @@
 """
-Al Brooks 日内机会寻找训练器 V12.1
-核心理念：观察市场 → 描述行为 → 形成观点 → 验证
-
-训练流程：
-1. 观察最近30根K线
-2. 回答三个问题：
-   - 市场在做什么？（描述你看到的行为）
-   - 你判断的依据是什么？（引用具体K线编号）
-   - 如果判断错误，会出现什么信号？
-3. AI挑战你的观察，但不是判断对错
-4. 推进10根新K线，验证你的判断
+Al Brooks 日内机会寻找训练器 V12.2
+修复：K线编号统一从1开始，与图表显示一致
 """
 
 import streamlit as st
@@ -21,7 +12,6 @@ import akshare as ak
 from openai import OpenAI
 import random
 import time
-from datetime import datetime
 
 # ==================== 配置 ====================
 SYMBOL_NAMES = {
@@ -44,6 +34,9 @@ EXCHANGES = {
 PERIODS = ["5", "15", "30", "60"]
 PERIOD_LABELS = {"5": "5分钟", "15": "15分钟", "30": "30分钟", "60": "60分钟"}
 
+# 每页显示的K线数量
+DISPLAY_BARS = 60
+
 # ==================== 数据加载 ====================
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_futures_data(symbol, period):
@@ -60,26 +53,28 @@ def load_futures_data(symbol, period):
         return None
 
 
-# ==================== 图表绘制（白色背景，每根K线都有编号）====================
-def build_chart(df, current_pos=None, highlight_range=None):
+# ==================== 图表绘制（编号从1开始）====================
+def build_chart(df, start_display_idx=0, current_display_pos=None, highlight_end=None):
     """
-    绘制K线图 - 白色背景
-    - 每根K线都有编号（K1, K2, K3...）
-    - 编号显示在K线下方（阳线）或上方（阴线）
+    绘制K线图
+    - start_display_idx: 从原始数据中的哪个索引开始显示（0表示第一根）
+    - current_display_pos: 当前观察到的位置（显示编号，从1开始）
+    - highlight_end: 高亮到哪个显示编号
     """
-    start = max(0, len(df) - 80)
-    plot_df = df.iloc[start:].copy().reset_index(drop=True)
+    # 取要显示的数据段
+    end_idx = min(start_display_idx + DISPLAY_BARS, len(df))
+    plot_df = df.iloc[start_display_idx:end_idx].copy().reset_index(drop=True)
     n_bars = len(plot_df)
     
-    # 编号从1开始
-    bar_numbers = list(range(start + 1, start + n_bars + 1))
+    # 显示编号：从1开始，不管原始索引是多少
+    display_numbers = list(range(1, n_bars + 1))
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         vertical_spacing=0.02, row_heights=[0.75, 0.25]
     )
 
-    # K线（红色阳线，绿色阴线，更符合国内习惯）
+    # K线
     fig.add_trace(go.Candlestick(
         x=plot_df.index,
         open=plot_df['open'], high=plot_df['high'],
@@ -90,7 +85,7 @@ def build_chart(df, current_pos=None, highlight_range=None):
     ), row=1, col=1)
 
     # 每根K线都标注编号
-    for idx, bar_num in enumerate(bar_numbers):
+    for idx, bar_num in enumerate(display_numbers):
         row = plot_df.iloc[idx]
         # 阳线：编号标在下方；阴线：编号标在上方
         if row['close'] >= row['open']:
@@ -110,7 +105,7 @@ def build_chart(df, current_pos=None, highlight_range=None):
         )
     
     # 每10根用更明显的标记突出显示
-    for idx, bar_num in enumerate(bar_numbers):
+    for idx, bar_num in enumerate(display_numbers):
         if bar_num % 10 == 0:
             row = plot_df.iloc[idx]
             if row['close'] >= row['open']:
@@ -128,30 +123,26 @@ def build_chart(df, current_pos=None, highlight_range=None):
                 row=1, col=1
             )
 
-    # 标记当前位置
-    if current_pos is not None and current_pos > start:
-        pos_in_chart = current_pos - start - 1
-        if 0 <= pos_in_chart < n_bars:
-            fig.add_vline(
-                x=pos_in_chart, line_dash="dash",
-                line_color="#ff9800", line_width=2, opacity=0.8
-            )
-            fig.add_annotation(
-                x=pos_in_chart, y=plot_df.iloc[pos_in_chart]['high'],
-                text="← 当前位置", showarrow=False,
-                font=dict(size=10, color="#ff9800"),
-                yshift=15
-            )
+    # 标记当前位置（显示编号对应的图表位置）
+    if current_display_pos is not None and 1 <= current_display_pos <= n_bars:
+        fig.add_vline(
+            x=current_display_pos - 1, line_dash="dash",
+            line_color="#ff9800", line_width=2, opacity=0.8
+        )
+        fig.add_annotation(
+            x=current_display_pos - 1, y=plot_df.iloc[current_display_pos - 1]['high'],
+            text="← 当前位置", showarrow=False,
+            font=dict(size=10, color="#ff9800"),
+            yshift=15
+        )
     
-    # 高亮观察范围
-    if highlight_range:
-        start_idx, end_idx = highlight_range
-        if start_idx >= start and end_idx <= start + n_bars:
-            fig.add_vrect(
-                x0=start_idx - start, x1=end_idx - start,
-                fillcolor="#4caf50", opacity=0.1,
-                layer="below", line_width=0
-            )
+    # 高亮观察范围（从K1到highlight_end）
+    if highlight_end is not None and highlight_end <= n_bars:
+        fig.add_vrect(
+            x0=0, x1=highlight_end - 1,
+            fillcolor="#4caf50", opacity=0.1,
+            layer="below", line_width=0
+        )
 
     # 成交量
     vol_colors = ["#ef5350" if c >= o else "#26a69a"
@@ -182,7 +173,7 @@ CHALLENGE_PROMPT = """你是 Al Brooks 价格行为教练。
 你不是老师，你是陪练。你的任务是挑战用户的观察，而不是判断对错。
 
 【用户观察的K线范围】
-K{start} ~ K{end}
+K1 ~ K{end}
 
 【用户认为市场在做什么】
 {observation}
@@ -223,7 +214,7 @@ VERIFICATION_PROMPT = """你是 Al Brooks 价格行为教练。
 """
 
 
-def call_challenge(start_bar, end_bar, observation, evidence, fail_signal):
+def call_challenge(end_bar, observation, evidence, fail_signal):
     """AI挑战用户"""
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
@@ -233,7 +224,6 @@ def call_challenge(start_bar, end_bar, observation, evidence, fail_signal):
         return "请引用具体K线补充你的观察。"
     
     prompt = CHALLENGE_PROMPT.format(
-        start=start_bar,
         end=end_bar,
         observation=observation[:200],
         evidence=evidence[:200],
@@ -287,18 +277,15 @@ def init_state():
         "df": None,
         "symbol": None,
         "period": "15",
-        "phase": "select",
-        "current_pos": 30,
-        "observation_start": 1,
-        "observation_end": 30,
+        "phase": "select",           # select / observe / challenge / verify / complete
+        "start_display_idx": 0,      # 从原始数据的哪个索引开始显示
+        "current_display_pos": 30,   # 当前观察到的位置（显示编号，从1开始）
         "user_observation": "",
         "user_evidence": "",
         "user_fail_signal": "",
         "ai_challenge": "",
         "verification_result": "",
-        "verification_start": 0,
         "practice_count": 0,
-        "history": [],
         "current_practice_start": None,
     }
     for k, v in defaults.items():
@@ -313,29 +300,28 @@ def reset_training():
     st.session_state.user_fail_signal = ""
     st.session_state.ai_challenge = ""
     st.session_state.verification_result = ""
-    st.session_state.verification_start = 0
 
 
 def load_symbol(code, period):
     with st.spinner(f"加载 {code} {PERIOD_LABELS[period]}数据..."):
         df = load_futures_data(code, period)
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 50:
         return False
+    
     st.session_state.df = df
     st.session_state.symbol = code
     st.session_state.period = period
-    st.session_state.current_pos = 30
-    st.session_state.observation_start = 1
-    st.session_state.observation_end = 30
+    # 从最新的数据中取一段，确保有足够K线
+    st.session_state.start_display_idx = max(0, len(df) - DISPLAY_BARS)
+    st.session_state.current_display_pos = 30
     reset_training()
     return True
 
 
-# ==================== 主界面（白色背景）====================
+# ==================== 主界面 ====================
 def main():
     st.set_page_config(page_title="Al Brooks 读盘训练器", layout="wide")
     
-    # 白色背景CSS
     st.markdown("""
     <style>
     .stApp { background-color: #ffffff; }
@@ -355,15 +341,10 @@ def main():
     .stButton > button:hover {
         background: #e0e0e0;
         border-color: #999999;
-        color: #333333;
     }
     .stTextArea textarea {
         background-color: #fafafa;
         border-color: #dddddd;
-        color: #333333;
-    }
-    .stTextArea textarea:focus {
-        border-color: #4caf50;
     }
     .stProgress > div > div {
         background-color: #4caf50;
@@ -386,7 +367,7 @@ def main():
 
     init_state()
 
-    # 侧边栏（白色/浅灰色）
+    # 侧边栏
     with st.sidebar:
         st.markdown("## 📊 Al Brooks 读盘训练器")
         st.markdown("---")
@@ -428,9 +409,9 @@ def main():
         <div class="info-box">
             <div class="info-box-title">📖 训练流程</div>
             <div style="color:#333333;line-height:1.8;">
-                1. 观察最近30根K线<br>
+                1. 观察K1到K30的K线图<br>
                 2. 回答三个问题：
-                   - 市场在做什么？（描述你看到的行为）<br>
+                   - 市场在做什么？<br>
                    - 你的判断依据是什么？（引用具体K线编号）<br>
                    - 如果判断错误，会出现什么信号？<br>
                 3. AI会挑战你的观察（不是判断对错）<br>
@@ -453,11 +434,11 @@ def main():
         with col1:
             if st.button("🔄 继续训练", type="primary"):
                 st.session_state.practice_count += 1
-                max_pos = len(df) - 10
-                new_pos = random.randint(40, min(60, max_pos))
-                st.session_state.current_pos = new_pos
-                st.session_state.observation_start = 1
-                st.session_state.observation_end = new_pos
+                # 随机换一段数据
+                max_start = max(0, len(df) - DISPLAY_BARS)
+                new_start = random.randint(0, max_start)
+                st.session_state.start_display_idx = new_start
+                st.session_state.current_display_pos = 30
                 reset_training()
                 st.rerun()
         with col2:
@@ -470,22 +451,19 @@ def main():
 
     # 观察阶段
     if st.session_state.phase == "observe":
+        # 显示图表（K1到K60）
         st.plotly_chart(
             build_chart(
                 df,
-                current_pos=st.session_state.current_pos,
-                highlight_range=(st.session_state.observation_start, st.session_state.observation_end)
+                start_display_idx=st.session_state.start_display_idx,
+                current_display_pos=st.session_state.current_display_pos,
+                highlight_end=st.session_state.current_display_pos
             ),
             use_container_width=True
         )
         
-        st.progress(
-            st.session_state.current_pos / len(df),
-            text=f"当前观察到了 K{st.session_state.current_pos} / 共{len(df)}根K线"
-        )
-        
-        st.markdown(f"### 🔍 观察 K1 → K{st.session_state.current_pos}")
-        st.markdown("请回答以下三个问题：")
+        st.markdown(f"### 🔍 观察 K1 → K{st.session_state.current_display_pos}")
+        st.info("💡 提示：图表中每根K线都有编号（K1、K2、K3...），请引用具体编号说明你的判断依据。")
         
         with st.form(key="observation_form"):
             observation = st.text_area(
@@ -516,8 +494,7 @@ def main():
                     
                     with st.spinner("AI思考中..."):
                         challenge = call_challenge(
-                            st.session_state.observation_start,
-                            st.session_state.observation_end,
+                            st.session_state.current_display_pos,
                             observation, evidence, fail_signal
                         )
                     st.session_state.ai_challenge = challenge
@@ -531,8 +508,9 @@ def main():
         st.plotly_chart(
             build_chart(
                 df,
-                current_pos=st.session_state.current_pos,
-                highlight_range=(st.session_state.observation_start, st.session_state.observation_end)
+                start_display_idx=st.session_state.start_display_idx,
+                current_display_pos=st.session_state.current_display_pos,
+                highlight_end=st.session_state.current_display_pos
             ),
             use_container_width=True
         )
@@ -555,37 +533,40 @@ def main():
                 st.rerun()
         with col2:
             if st.button("➡️ 继续，进入验证", type="primary", use_container_width=True):
-                st.session_state.verification_start = st.session_state.current_pos
                 st.session_state.phase = "verify"
                 st.rerun()
 
-    # 验证阶段
+    # 验证阶段（推进10根K线）
     elif st.session_state.phase == "verify":
-        new_pos = min(st.session_state.current_pos + 10, len(df))
+        new_pos = min(st.session_state.current_display_pos + 10, DISPLAY_BARS)
         
         st.plotly_chart(
             build_chart(
                 df,
-                current_pos=new_pos,
-                highlight_range=(st.session_state.observation_start, new_pos)
+                start_display_idx=st.session_state.start_display_idx,
+                current_display_pos=new_pos,
+                highlight_end=new_pos
             ),
             use_container_width=True
         )
         
-        st.progress(new_pos / len(df), text=f"已推进到 K{new_pos}")
-        
-        st.markdown(f"### 🔍 验证阶段：K{st.session_state.current_pos+1} → K{new_pos}")
+        st.markdown(f"### 🔍 验证阶段：K{st.session_state.current_display_pos+1} → K{new_pos}")
         st.markdown("新出现的K线是否改变了你的判断？")
         
+        # 显示新K线的简要描述
+        # 需要从数据中提取对应的K线
         new_bars_text = ""
-        for i in range(st.session_state.current_pos, new_pos):
-            row = df.iloc[i]
-            bar_num = i + 1
-            direction = "阳" if row['close'] >= row['open'] else "阴"
-            new_bars_text += f"K{bar_num}: {direction}线，O={row['open']:.0f} H={row['high']:.0f} L={row['low']:.0f} C={row['close']:.0f}\n"
+        start_idx = st.session_state.start_display_idx
+        for i in range(st.session_state.current_display_pos, new_pos):
+            data_idx = start_idx + i
+            if data_idx < len(df):
+                row = df.iloc[data_idx]
+                bar_num = i + 1
+                direction = "阳" if row['close'] >= row['open'] else "阴"
+                new_bars_text += f"K{bar_num}: {direction}线，开={row['open']:.0f} 高={row['high']:.0f} 低={row['low']:.0f} 收={row['close']:.0f}\n"
         
         with st.expander("📊 新K线详情", expanded=True):
-            st.text(new_bars_text)
+            st.text(new_bars_text if new_bars_text else "无新K线数据")
         
         if st.session_state.user_fail_signal:
             st.info(f"💡 你之前设定的反证信号：{st.session_state.user_fail_signal}")
@@ -612,7 +593,7 @@ def main():
                         )
                     st.session_state.verification_result = verification
                     st.session_state.ai_verification = ai_response
-                    st.session_state.current_pos = new_pos
+                    st.session_state.current_display_pos = new_pos
                     st.session_state.phase = "complete"
                     st.rerun()
                 else:

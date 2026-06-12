@@ -19,7 +19,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import akshare as ak
 from openai import OpenAI
-from scipy.signal import argrelextrema
 import random, time
 from datetime import datetime
 
@@ -86,10 +85,32 @@ def compute_bar_features(df):
 
 
 def find_swings(df, order=3):
-    sh_idx = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
-    sl_idx = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
-    return ([(int(i), float(df['high'].iloc[i])) for i in sh_idx],
-            [(int(i), float(df['low'].iloc[i])) for i in sl_idx])
+    """纯numpy实现摆动点识别，无需scipy"""
+    high = df['high'].values
+    low  = df['low'].values
+    n = len(high)
+    sh, sl = [], []
+    for i in range(order, n - order):
+        h_win = high[i-order : i+order+1]
+        l_win = low[i-order  : i+order+1]
+        if high[i] >= max(h_win):
+            sh.append((i, float(high[i])))
+        if low[i] <= min(l_win):
+            sl.append((i, float(low[i])))
+    # 去重：相邻重复高/低点只保留最极端的那个
+    def dedup(pts, key_fn, cmp_fn):
+        if not pts: return pts
+        result = [pts[0]]
+        for p in pts[1:]:
+            if p[0] - result[-1][0] <= order:
+                if cmp_fn(p[1], result[-1][1]):
+                    result[-1] = p
+            else:
+                result.append(p)
+        return result
+    sh = dedup(sh, lambda x: x[1], lambda a, b: a > b)
+    sl = dedup(sl, lambda x: x[1], lambda a, b: a < b)
+    return sh, sl
 
 
 def classify_trend(sh, sl):

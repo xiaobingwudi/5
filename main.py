@@ -1,7 +1,7 @@
 """
-Al Brooks 实盘逐K心智决策训练器 V5.0
+Al Brooks 实盘逐K心智决策训练器 V5.0 (修正稳定版)
 核心：先判环境（State），再定方向（Always In）
-验证：由AI终审裁决，而非死板的涨跌逻辑
+验证：由AI终审裁决，完美对齐 Price Action 逻辑
 """
 
 import streamlit as st
@@ -13,8 +13,6 @@ import akshare as ak
 from openai import OpenAI
 import random
 import time
-import re
-from datetime import datetime
 
 # ==================== 配置 ====================
 SYMBOL_NAMES = {
@@ -34,71 +32,43 @@ EXCHANGES = {
 }
 PERIODS = {"5": "5分钟", "15": "15分钟", "30": "30分钟", "60": "60分钟"}
 
-# 五步标签（新顺序）
 FIVE_STEPS = ["Market State", "Always In", "Location", "Signal", "Trade Plan"]
-
-# Always In信心等级
 CONFIDENCE_LEVELS = ["51%（勉强偏向）", "55%", "60%", "70%", "80%以上（强烈确信）"]
-
-# 胜率类型
-WIN_RATE_TYPES = ["高胜率 / 低盈亏比（如区间反转）",
-                  "中等胜率 / 中等盈亏比（如趋势回调）",
-                  "低胜率 / 高盈亏比（如突破交易）"]
-
-# 验证选项
-VER_OPTIONS = ["✅ 交易假设维持（逻辑仍然成立）",
-               "⚠️ 交易假设减弱（仍持有但需观察）",
-               "❌ 交易假设失效（需要退出或反向）"]
-
-# Brooks经典信号选项
+WIN_RATE_TYPES = ["高胜率 / 低盈亏比（如区间反转）", "中等胜率 / 中等盈亏比（如趋势回调）", "低胜率 / 高盈亏比（如突破交易）"]
+VER_OPTIONS = ["✅ 交易假设维持（逻辑仍然成立）", "⚠️ 交易假设减弱（仍持有但需观察）", "❌ 交易假设失效（需要退出或反向）"]
 SIGNAL_OPTIONS = ["无明显信号（放弃）", "趋势K线（Trend Bar）", "反转棒（Reversal Bar）", "内包棒（Inside Bar）",
                   "H1 / H2（多头一买/二买）", "L1 / L2（空头一卖/二卖）", "ii（连续内包）", "IOI（内-外-内）"]
 
-# ==================== 1. 强化版：结构预处理与特征提取 ====================
+# ==================== 1. 结构预处理与特征提取 ====================
 
 def compute_bar_features(df):
-    """
-    深度提取 Al Brooks 价格行为体系所需的微观K线特征
-    """
     df = df.copy()
-    # 确保列名小写
     df.columns = [c.lower() for c in df.columns]
     
-    # 基础物理量
     df['body'] = abs(df['close'] - df['open'])
     df['total_range'] = df['high'] - df['low']
     df['body_ratio'] = np.where(df['total_range'] > 0, df['body'] / df['total_range'], 0)
     df['direction'] = np.where(df['close'] >= df['open'], 'bull', 'bear')
     
-    # 引线计算
     df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
     
-    # 1. 核心：连续K线的重叠度（Overlap）- Brooks 区间市场的核心判定指标
     prev_high = df['high'].shift(1)
     prev_low = df['low'].shift(1)
     overlap_height = np.minimum(df['high'], prev_high) - np.maximum(df['low'], prev_low)
     df['is_overlap'] = overlap_height > 0
     
-    # 2. 核心：收盘价在全根K线中的绝对相对位置
     df['close_pos_ratio'] = np.where(df['total_range'] > 0, (df['close'] - df['low']) / df['total_range'], 0.5)
-    
-    # 3. 经典K线形态
     df['is_inside'] = (df['high'] <= prev_high) & (df['low'] >= prev_low)
     df['is_outside'] = (df['high'] > prev_high) & (df['low'] < prev_low)
     
-    # 4. 大K线（Surprise Bar）
     avg_body = df['body'].rolling(20, min_periods=3).mean()
     df['is_big'] = df['body'] > (avg_body * 1.5)
-    
-    # 5. ATR
     df['atr'] = df['total_range'].rolling(20, min_periods=3).mean()
     
     return df
 
-
 def find_swings(df, order=3):
-    """纯numpy摆动点识别"""
     high = df['high'].values
     low  = df['low'].values
     n = len(high)
@@ -115,45 +85,30 @@ def find_swings(df, order=3):
         result = [pts[0]]
         for p in pts[1:]:
             if p[0] - result[-1][0] <= order:
-                if cmp_fn(p[1], result[-1][1]):
-                    result[-1] = p
-            else:
-                result.append(p)
+                if cmp_fn(p[1], result[-1][1]): result[-1] = p
+            else: result.append(p)
         return result
-    sh = dedup(sh, lambda a, b: a > b)
-    sl = dedup(sl, lambda a, b: a < b)
-    return sh, sl
-
+    return dedup(sh, lambda a, b: a > b), dedup(sl, lambda a, b: a < b)
 
 def build_behavior_context(df, n_bars=60):
-    """
-    将图表几何结构与微观博弈完全转化为结构化文本，赋予AI完美的"数字视觉"
-    """
-    if len(df) < 20: 
-        return None, {}
-        
+    if len(df) < 20: return None, {}
     data = df.tail(n_bars).copy().reset_index(drop=True)
     data = compute_bar_features(data)
     
-    # 计算当前波动率基准
     current_atr = float(data['atr'].iloc[-1]) if not pd.isna(data['atr'].iloc[-1]) else 10.0
     current_price = float(data['close'].iloc[-1])
     
-    # 提取传统的 Swing High / Low 几何高低点
     order = max(2, len(data) // 15)
     sh, sl = find_swings(data, order)
     
-    # --- Brooks 专属特征统计 ---
-    # 1. 统计最近 10 根 K 线的重叠率
     recent_overlap_ratio = float(data['is_overlap'].tail(10).mean())
     if recent_overlap_ratio >= 0.7:
-        overlap_desc = "【极高重叠度】（典型的交易区间 Trading Range 特征，市场无方向）"
+        overlap_desc = "【极高重叠度】（典型的交易区间 Trading Range 特征，市场无明显方向）"
     elif recent_overlap_ratio <= 0.3:
-        overlap_desc = "【极低重叠度】（典型的强趋势推进特征，动能极强）"
+        overlap_desc = "【极低重叠度】（典型的强趋势推进特征，动能非对称性极强）"
     else:
         overlap_desc = "【中等重叠度】（弱趋势通道或震荡筑底阶段）"
         
-    # 2. 统计最近 5 根 K 线的收盘价倾向
     recent_close_pos = float(data['close_pos_ratio'].tail(5).mean())
     if recent_close_pos > 0.65:
         pos_desc = "最近5根K线多收在【高位】（买盘逢低介入坚决）"
@@ -162,16 +117,13 @@ def build_behavior_context(df, n_bars=60):
     else:
         pos_desc = "最近5根K线收盘位置【均衡】（多空博弈剧烈）"
         
-    # 3. 统计最近 10 根 K 线的实体性质
     bull_bars = data.tail(10)[data.tail(10)['direction'] == 'bull']
     bear_bars = data.tail(10)[data.tail(10)['direction'] == 'bear']
     big_bars_count = int(data['is_big'].tail(10).sum())
     
-    # 寻找最近的几何边界
     dist_to_high = (float(sh[-1][1]) - current_price) if sh else current_atr * 5
     dist_to_low = (current_price - float(sl[-1][1])) if sl else current_atr * 5
 
-    # 组装上下文文本
     context = f"""[当前市场行为扫描]
 - 当前价格: {current_price:.2f} | 20周期均幅(ATR): {current_atr:.2f}
 - 微观重叠特征: {overlap_desc} (最近10根重叠率: {recent_overlap_ratio:.0%})
@@ -190,266 +142,108 @@ def build_behavior_context(df, n_bars=60):
         big_str = " [大K线!]" if row['is_big'] else ""
         context += f"  - 倒数第{i}根K线(K_{t_idx}): {'阳' if row['direction']=='bull' else '阴'}线, 收盘位置比率:{row['close_pos_ratio']:.2%}{inside_str}{outside_str}{big_str}\n"
 
-    struct_data = {
-        "swing_highs": sh, "swing_lows": sl, "atr": current_atr, "price": current_price,
-        "dist_to_high": dist_to_high, "dist_to_low": dist_to_low
-    }
-    return context, struct_data
+    return context, {"swing_highs": sh, "swing_lows": sl, "atr": current_atr, "price": current_price}
 
+# ==================== AI 提示词 ====================
+STEP2_GRADER = """你是Al Brooks。请严格根据Price Action理论批改学员对环境与方向的判断。
+【图表行为】\n{context}
+【学员判断】\n市场状态：{state}\nAlways In方向：{direction}\n信心等级：{confidence}\n理由：{reason}
+【批改要求】\n1. 方向：在此环境状态（{state}）下选这个方向合理吗？\n2. 信心：在区间市中高信心通常是错的，请评判其信心是否合理。\n3. 指出做反方向最有力的那一根K线证据。\n【裁决】correct / partial / wrong"""
 
-# ==================== AI提示词 ====================
+STEP3_GRADER = """你是Al Brooks。请批改学员对空间与风险的预估。
+【图表行为】\n{context}
+【学员判断】\n上方空间预估：{upside} ATR | 下方风险预估：{downside} ATR\n依据理由：{reason}
+【批改】\n1. 空间预估是否准确？结合局部高低點和ATR进行数学评判。\n2. 应该以哪一个显着的高低点或K线作为风控基准？\n【裁决】correct / partial / wrong"""
 
-# Step2 批改
-STEP2_GRADER = """你是Al Brooks，批改学员的Always In判断。
+STEP4_GRADER = """你是Al Brooks。请批改学员选择的信号K线。
+【图表行为】\n{context}
+【学员选择】\n信号模式：{signal_mode} | 引用K线：{k_ref}
+【批改】\n1. 該信號模式是否在當前環境下具備高勝率？\n2. 如果該信號隨後失敗了，在Brooks體系中往往預示著什麼機會？\n【裁决】correct / partial / wrong"""
 
-【图表行为】
-{context}
+STEP5_GRADER = """你是Al Brooks。请批改交易计划的自洽性。
+【五步汇总】\n环境方向：{state} | {direction}\n空间信号：{location} | {signal}
+【学员计划】\n决策：{decision} | 胜率类型：{win_rate_type}\n放弃/离场条件：{abandon}
+【批改】\n1. 计划与前面的环境、信号是否完全自洽？\n2. 设定的放弃条件是否足够具体到特定K线或价位突破？\n【裁决】correct / partial / wrong"""
 
-【学员判断】
-市场状态：{state}
-方向：{direction}
-信心：{confidence}
-理由：{reason}
+VERIFICATION_GRADER = """你是Al Brooks，請根據Price Action原理對學員的交易假設進行【終審裁決】。
+【原始交易假設】\n环境状态：{state} | Always In方向：{direction} | 设定的放弃条件：{abandon}
+【验证期实际走势】（共{ver_total}根新K线）\n{new_bars}
+【学员的自我评判】\n他认为后市走势证明他的假设应该：{ver_choice}\n理由：{ver_reason}
 
-【批改】
-1. 方向：与当前市场状态（{state}）是否冲突？
-2. 信心：{confidence}合理吗？在区间市中是否过于自信？
-3. 反方：做反方向最有力的K线是哪根？
-
-【裁决】correct / partial / wrong"""
-
-# Step3 (原 Step4) 批改
-STEP3_GRADER = """你是Al Brooks，批改学员的空间判断。
-
-【图表行为】
-{context}
-
-【学员判断】
-上方空间预估：{upside} ATR
-下方风险预估：{downside} ATR
-理由：{reason}
-
-【批改】
-1. 空间判断是否准确？参考ATR数据
-2. 最重要的参照价位是哪根K线？
-3. 如果空间不足，正确做法是什么？
-
-【裁决】correct / partial / wrong"""
-
-
-# Step4 批改
-STEP4_GRADER = """你是Al Brooks，批改学员的Signal判断。
-
-【图表行为】
-{context}
-
-【学员选择】
-信号模式：{signal_mode}
-引用K线：{k_ref}
-
-【批改】
-1. 该信号是否与当前市场状态和位置匹配？
-2. 如果这个信号失败，它通常意味着什么？（维持/减弱/反转）
-3. 引用具体K线位置说明理由。
-
-【裁决】correct / partial / wrong"""
-
-
-STEP5_GRADER = """你是Al Brooks，批改学员的交易计划。
-
-【五步汇总】
-市场状态：{state}
-Always In：{direction}（{confidence}）
-空间判断：{location}
-信号：{signal}
-
-【学员计划】
-决策：{decision}
-胜率类型：{win_rate_type}
-放弃条件：{abandon}
-
-【批改】
-1. 四个条件都满足吗？
-2. 胜率类型与交易类型匹配吗？
-3. 放弃条件是否具体？
-4. 最终裁决：做/不做/条件性做
-
-【裁决】correct / partial / wrong"""
-
-
-# 验证终审（AI核心）
-VERIFICATION_GRADER = """你是Al Brooks，请根据Price Action原理对学员的交易假设进行终审裁决。
-
-【原始交易假设】
-环境状态：{state}
-Always In方向：{direction}
-设定的放弃条件：{abandon}
-
-【验证期完整K线数据】（共{ver_total}根）
-{new_bars}
-
-【学员的自我评判】
-他认为交易假设应该：{ver_choice}
-理由：{ver_reason}
-
-【Al Brooks裁决标准】
+【Al Brooks 终审标准】
 - 横盘（Trading Range）代表趋势的暂停，只要未发生强力的反向突破，原假设就没有被破坏，仅代表动能减弱（对应 partial）。
-- 如果学员判断错误（如明明是区间却说趋势维持），请给出正确的判断。
+- 仔细核对学判定。若学员自我评判与实际行情演化相符，输出correct；若盲目乐观/悲观，输出wrong。
+【裁决】correct / partial / wrong"""
 
-【裁决】correct / partial / wrong
-（如学员判断正确则输出correct，反之则输出wrong）"""
+COACH_REPORT_PROMPT = """你是Al Brooks首席教练。根据学员完成的{rounds}轮实战逐K测试，生成300字以内的专业心智复盘报告。
+得分率：环境与方向:{s1}% | 空间预估:{s2}% | 信号卡定:{s3}% | 计划自洽:{s4}%
+假设终审正确率: {survival:.0f}%
+【要求】指出他最严重的1個心智盲點，給出1個具體的Brooks訓練動作，並予以交易員式的硬核鼓勵。"""
 
-
-COACH_REPORT_PROMPT = """你是Al Brooks首席教练，写训练报告。
-
-【数据】{symbol} {period}，{rounds}轮，{total_min:.0f}分钟
-【五步得分】State:{s1}% AI:{s2}% Loc:{s3}% Sig:{s4}% Plan:{s5}%
-【假设存活率】{survival:.0f}%
-【错误】{errors}
-
-【要求】
-1. 最薄弱的1-2步及具体错误
-2. 针对性建议
-3. 最好的一步
-4. 鼓励
-
-300字。"""
-
-
-# ==================== AI调用 ====================
-
+# ==================== AI 调用 ====================
 def get_client():
     key = st.secrets.get("OPENAI_API_KEY", "")
     url = st.secrets.get("OPENAI_BASE_URL", "https://api.deepseek.com")
     model = st.secrets.get("OPENAI_MODEL", "deepseek-chat")
     return OpenAI(base_url=url, api_key=key), model, bool(key)
 
-
 def call_ai(prompt, max_tokens=500, temp=0.3):
     client, model, has_key = get_client()
-    if not has_key:
-        return "（未配置OPENAI_API_KEY）"
+    if not has_key: return "（未配置 API_KEY，请在 .streamlit/secrets.toml 中配置）"
     try:
-        r = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temp, max_tokens=max_tokens
-        )
+        r = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], temperature=temp, max_tokens=max_tokens)
         return r.choices[0].message.content
-    except Exception as e:
-        return f"AI调用失败：{str(e)[:100]}"
-
+    except Exception as e: return f"AI调用失败：{str(e)[:100]}"
 
 def parse_grade_and_score(ai_response, step_name):
     for line in reversed(ai_response.strip().split("\n")):
         line = line.strip()
-        if "【裁决】" in line:
-            if "correct" in line:
-                st.session_state.scores[step_name].append(1.0)
-            elif "partial" in line:
-                st.session_state.scores[step_name].append(0.5)
-            elif "wrong" in line:
-                st.session_state.scores[step_name].append(0.0)
+        if "【裁决】" in line or "[裁决]" in line or "裁决" in line:
+            if "correct" in line.lower(): st.session_state.scores[step_name].append(1.0)
+            elif "partial" in line.lower(): st.session_state.scores[step_name].append(0.5)
+            else: st.session_state.scores[step_name].append(0.0)
             return
     st.session_state.scores[step_name].append(0.0)
 
-
-# ==================== 数据加载 ====================
-
-@st.cache_data(ttl=1800, show_spinner=False)
+# ==================== 数据与图表 ====================
 def load_data(symbol, period):
     try:
         df = ak.futures_zh_minute_sina(symbol=f"{symbol}0", period=period)
-        if df is None or len(df) < 100: 
-            return None
-        # 统一列名
-        df = df.rename(columns={
-            "date": "time", "open": "open", "high": "high",
-            "low": "low", "close": "close", "volume": "volume"
-        })
+        if df is None or len(df) < 100: return None
+        df.columns = [c.lower() for c in df.columns]
+        df = df.rename(columns={"date": "time"})
         return df.reset_index(drop=True)
-    except Exception as e:
-        return None
-
-
-# ==================== 图表 ====================
+    except: return None
 
 def build_chart(df, obs_end, extra_bars=0, sh=None, sl=None):
     view_end = min(obs_end + extra_bars, len(df))
-    display_n = 80
-    start = max(0, view_end - display_n)
+    start = max(0, view_end - 80)
     data = df.iloc[start:view_end].copy().reset_index(drop=True)
-    n = len(data)
     offset = start
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.02, row_heights=[0.76, 0.24])
-
-    fig.add_trace(go.Candlestick(
-        x=data.index, open=data['open'], high=data['high'],
-        low=data['low'], close=data['close'], showlegend=False,
-        increasing_line_color="#ef5350", decreasing_line_color="#26a69a",
-    ), row=1, col=1)
-
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.75, 0.25])
+    fig.add_trace(go.Candlestick(x=data.index, open=data['open'], high=data['high'], low=data['low'], close=data['close'], showlegend=False, increasing_line_color="#ef5350", decreasing_line_color="#26a69a"), row=1, col=1)
+    
     ema = data['close'].ewm(span=20).mean()
-    fig.add_trace(go.Scatter(
-        x=data.index, y=ema,
-        line=dict(color="#ff9800", width=1.2, dash="dot"),
-        name="EMA20", showlegend=True
-    ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=ema, line=dict(color="#ff9800", width=1.2, dash="dot"), name="EMA20"), row=1, col=1)
 
     if sh:
         for idx, val in sh:
-            pi = idx - offset
-            if 0 <= pi < n:
-                fig.add_annotation(x=pi, y=val, text="H",
-                    font=dict(size=9, color="#ef5350"), showarrow=False, yshift=11, row=1, col=1)
+            if 0 <= idx - offset < len(data):
+                fig.add_annotation(x=idx-offset, y=val, text="H", font=dict(size=9, color="#ef5350"), showarrow=False, yshift=10, row=1, col=1)
     if sl:
         for idx, val in sl:
-            pi = idx - offset
-            if 0 <= pi < n:
-                fig.add_annotation(x=pi, y=val, text="L",
-                    font=dict(size=9, color="#26a69a"), showarrow=False, yshift=-13, row=1, col=1)
+            if 0 <= idx - offset < len(data):
+                fig.add_annotation(x=idx-offset, y=val, text="L", font=dict(size=9, color="#26a69a"), showarrow=False, yshift=-12, row=1, col=1)
 
-    # 观察截止线
     obs_plot = obs_end - start - 1
-    if 0 <= obs_plot < n:
-        fig.add_vline(x=obs_plot, line_dash="dash",
-                      line_color="#ff9800", line_width=1.5, opacity=0.8)
-        fig.add_annotation(x=obs_plot, y=data['high'].max(),
-            text="截止", font=dict(size=9, color="#ff9800"), showarrow=False, yshift=14)
+    if 0 <= obs_plot < len(data):
+        fig.add_vline(x=obs_plot, line_dash="dash", line_color="#ff9800", line_width=1.5)
+    if extra_bars > 0 and obs_plot < len(data):
+        fig.add_vrect(x0=max(0, obs_plot), x1=len(data)-1, fillcolor="#1976d2", opacity=0.08, layer="below", line_width=0)
 
-    # 验证区高亮（仅在展示时）
-    if extra_bars > 0 and obs_plot < n:
-        fig.add_vrect(x0=max(0, obs_plot), x1=n-1,
-                      fillcolor="#1976d2", opacity=0.06, layer="below", line_width=0)
-
-    # K线编号
-    for i in range(4, n, 5):
-        row_data = data.iloc[i]
-        abs_num = i + offset + 1
-        y = row_data['low'] if row_data['close'] >= row_data['open'] else row_data['high']
-        shift = -13 if row_data['close'] >= row_data['open'] else 13
-        fig.add_annotation(x=i, y=y, text=f"K{abs_num}",
-            showarrow=False, font=dict(size=8, color="#999"), yshift=shift)
-
-    vc = ["#ef5350" if c >= o else "#26a69a" for o, c in zip(data['open'], data['close'])]
-    fig.add_trace(go.Bar(x=data.index, y=data['volume'],
-                         marker_color=vc, showlegend=False, opacity=0.5), row=2, col=1)
-
-    fig.update_layout(
-        xaxis_rangeslider_visible=False, height=500,
-        margin=dict(l=8, r=8, t=25, b=8),
-        paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
-        font=dict(color="#333"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1, font=dict(size=11))
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#eeeeee", gridwidth=0.5,
-                     zeroline=False, showticklabels=False, row=1, col=1)
-    fig.update_xaxes(showgrid=True, gridcolor="#eeeeee", gridwidth=0.5, zeroline=False, row=2, col=1)
-    fig.update_yaxes(showgrid=True, gridcolor="#eeeeee", gridwidth=0.5, zeroline=False)
+    fig.update_layout(xaxis_rangeslider_visible=False, height=450, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="#ffffff", plot_bgcolor="#fafafa")
     return fig
-
 
 def get_new_bars_text(df, obs_end, n):
     lines = []
@@ -458,283 +252,190 @@ def get_new_bars_text(df, obs_end, n):
         if idx >= len(df): break
         row = df.iloc[idx]
         o, h, l, c = row['open'], row['high'], row['low'], row['close']
-        body = abs(c - o); total = h - l
-        br = body / total if total > 0 else 0
         d = "阳" if c >= o else "阴"
-        special = ""
-        if idx > 0:
-            prev = df.iloc[idx-1]
-            if h <= prev['high'] and l >= prev['low']: special = "（内包）"
-            elif h > prev['high'] and l < prev['low']: special = "（外包）"
-        lines.append(f"K{idx+1}{special}：{d}线 O={o:.0f} H={h:.0f} L={l:.0f} C={c:.0f} 实体{br:.0%}")
+        lines.append(f"K_{idx+1}: {d}线 [O:{o:.1f} H:{h:.1f} L:{l:.1f} C:{c:.1f}]")
     return "\n".join(lines)
 
-
 # ==================== Session State ====================
-
 def init_state():
     d = {
-        "df": None, "symbol": None, "period": "15",
-        "phase": "select",
-        "obs_end": 0,
-        "ver_total": 0,
-        "context": "",
-        "struct_data": {},
-        # 五步输入
-        "s2_state": "", "s2_evidence": "",
-        "s1_dir": "", "s1_confidence": "", "s1_reason": "",
-        "s3_upside": "", "s3_downside": "", "s3_reason": "",
-        "s4_signal_mode": "", "s4_kref": "",
-        "s5_decision": "", "s5_winrate_type": "", "s5_abandon": "",
-        # AI批改缓存
-        "grade_s2": None, "grade_s1": None, "grade_s3": None,
-        "grade_s4": None, "grade_s5": None, "grade_ver": None,
-        # 五步得分
-        "scores": {s: [] for s in FIVE_STEPS},
-        "verification_scores": [],
-        "round_errors": [],
-        "round_num": 0,
-        "round_start": None,
-        "round_times": [],
-        "coach_report": None,
-        "practice_count": 0,
-        "session_start": None,
+        "df": None, "symbol": None, "period": "15", "phase": "select",
+        "obs_end": 0, "ver_total": 0, "context": "", "struct_data": {},
+        "s2_state": "交易区间 (Trading Range)", "s2_evidence": "",
+        "s1_dir": "Always In 多头 (买方占优)", "s1_confidence": "55%", "s1_reason": "",
+        "s3_upside": 2.0, "s3_downside": 1.0, "s3_reason": "",
+        "s4_signal_mode": ["趋势K线（Trend Bar）"], "s4_kref": "",
+        "s5_decision": "顺势做多", "s5_winrate_type": "中等胜率 / 中等盈亏比（如趋势回调）", "s5_abandon": "",
+        "ver_choice": "✅ 交易假设维持（逻辑仍然成立）", "ver_reason": "",
+        "grade_s2": None, "grade_s1": None, "grade_s3": None, "grade_s4": None, "grade_s5": None, "grade_ver": None,
+        "scores": {s: [] for s in FIVE_STEPS}, "verification_scores": [], "round_errors": [], "round_num": 0, "coach_report": None
     }
     for k, v in d.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+        if k not in st.session_state: st.session_state[k] = v
 
-
-def reset_round():
-    for k in ["s2_state","s2_evidence",
-              "s1_dir","s1_confidence","s1_reason",
-              "s3_upside","s3_downside","s3_reason",
-              "s4_signal_mode","s4_kref",
-              "s5_decision","s5_winrate_type","s5_abandon",
-              "grade_s2","grade_s1","grade_s3",
-              "grade_s4","grade_s5","grade_ver"]:
-        st.session_state[k] = None if k.startswith("grade") else ""
-    st.session_state.round_start = time.time()
-
-
-def load_sym(code, period):
-    with st.spinner(f"加载 {code} {PERIODS[period]}..."):
-        df = load_data(code, period)
-    if df is None or len(df) < 100: 
-        return False
-    st.session_state.df = df
-    st.session_state.symbol = code
-    st.session_state.period = period
-    return True
-
-
-def start_round(df, n_bars=60):
+def start_round(df):
     ver_total = random.randint(6, 15)
-    max_obs = len(df) - ver_total - 10
-    min_obs = n_bars
-    if max_obs < min_obs: 
-        return False
-    obs_end = random.randint(min_obs, max_obs)
+    if len(df) - ver_total - 15 < 60: return False
+    obs_end = random.randint(60, len(df) - ver_total - 5)
     st.session_state.obs_end = obs_end
     st.session_state.ver_total = ver_total
-    result = build_behavior_context(df.iloc[:obs_end], n_bars)
-    if result[0] is None: 
-        return False
-    st.session_state.context = result[0]
-    st.session_state.struct_data = result[1]
+    ctx, sd = build_behavior_context(df.iloc[:obs_end], 60)
+    if ctx is None: return False
+    st.session_state.context = ctx
+    st.session_state.struct_data = sd
     st.session_state.round_num += 1
-    reset_round()
+    for k in ["grade_s2","grade_s1","grade_s3","grade_s4","grade_s5","grade_ver","s2_evidence","s1_reason","s3_reason","s4_kref","s5_abandon","ver_reason"]:
+        st.session_state[k] = None if k.startswith("grade") else ""
     return True
 
-
-def get_step_accuracy(step_name):
-    scores = st.session_state.scores.get(step_name, [])
-    return int(np.mean(scores) * 100) if scores else 0
-
-
-# ==================== CSS ====================
-CSS = """
-<style>
-.stApp { background:#fff; color:#222; }
-[data-testid="stSidebar"] { background:#f7f7f7 !important; border-right:1px solid #e8e8e8; }
-
-.step-header {
-    display:flex; align-items:center; gap:14px;
-    background:#f0f4ff; border-left:3px solid #1a56db;
-    border-radius:0 8px 8px 0;
-    padding:12px 18px; margin-bottom:16px;
-}
-.step-num {
-    background:#1a56db; color:#fff;
-    font-size:13px; font-weight:700;
-    border-radius:50%; width:28px; height:28px;
-    display:flex; align-items:center; justify-content:center;
-    font-family:monospace; flex-shrink:0;
-}
+# ==================== CSS 注入 ====================
+CSS = """<style>
+.stApp { background:#ffffff; color:#222222; }
+.step-header { display:flex; align-items:center; gap:12px; background:#f0f4ff; border-left:4px solid #1a56db; padding:10px; margin-bottom:15px; border-radius:4px; }
+.step-num { background:#1a56db; color:#fff; font-size:14px; font-weight:700; border-radius:50%; width:26px; height:26px; display:flex; align-items:center; justify-content:center; }
 .step-title { font-size:16px; font-weight:700; color:#1a3a8f; }
-.step-desc  { font-size:12px; color:#666; margin-top:2px; }
+.ai-box { background:#f0f4ff; border:1px solid #93c5fd; border-radius:6px; padding:12px; margin:10px 0; }
+.context-box { background:#fafafa; border:1px solid #ddd; border-radius:4px; padding:10px; font-family:monospace; font-size:12px; white-space:pre-wrap; }
+</style>"""
 
-.step-progress {
-    display:flex; gap:6px; margin-bottom:16px;
-}
-.step-dot {
-    flex:1; height:4px; border-radius:2px; background:#e8e8e8;
-}
-.step-dot.done    { background:#1a56db; }
-.step-dot.current { background:#60a5fa; }
-
-.ai-box {
-    background:#f0f4ff; border:1px solid #93c5fd;
-    border-radius:8px; padding:16px; margin:12px 0;
-}
-.ai-box-warn {
-    background:#fff7ed; border:1px solid #fdba74;
-    border-left:3px solid #f97316;
-    border-radius:8px; padding:16px; margin:12px 0;
-}
-.ai-box-ok {
-    background:#f0fdf4; border:1px solid #86efac;
-    border-radius:8px; padding:16px; margin:12px 0;
-}
-.ai-label { font-size:11px; color:#888; margin-bottom:8px; letter-spacing:.05em; }
-.ai-text  { color:#222; line-height:1.85; font-size:14px; }
-
-.score-grid { display:flex; gap:8px; margin:12px 0; flex-wrap:wrap; }
-.score-card {
-    flex:1; min-width:80px;
-    background:#f7f7f7; border:1px solid #e8e8e8;
-    border-radius:8px; padding:10px 8px; text-align:center;
-}
-.score-val { font-size:20px; font-weight:700; font-family:monospace; }
-.score-lbl { font-size:10px; color:#888; margin-top:2px; }
-
-.context-box {
-    background:#fafafa; border:1px solid #e8e8e8; border-radius:6px;
-    padding:12px; font-family:monospace; font-size:11px;
-    color:#555; line-height:1.7; white-space:pre-wrap;
-}
-
-.stButton>button {
-    border-radius:6px; border:1px solid #ddd;
-    background:#f5f5f5; color:#333; font-weight:500; transition:all .15s;
-}
-.stButton>button:hover { background:#1a56db; border-color:#1a56db; color:#fff; }
-.stTextArea textarea { background:#fafafa !important; color:#222 !important; border-color:#ddd !important; }
-.stRadio label { color:#333 !important; }
-div[data-testid="stExpander"] { background:#fafafa; border:1px solid #e8e8e8; border-radius:8px; }
-
-.brooks-note {
-    border-left:2px solid #f97316; padding:8px 14px;
-    color:#888; font-style:italic; font-size:12px; margin:10px 0;
-}
-.round-tag {
-    display:inline-block; background:#eef2ff; border:1px solid #a5b4fc;
-    border-radius:20px; padding:2px 12px; font-size:12px;
-    color:#1a3a8f; font-family:monospace;
-}
-</style>
-"""
-
-
-# ==================== 主界面 ====================
-
-def render_step_header(num, title, desc, total=5):
-    dots = ""
-    for i in range(1, total+1):
-        cls = "done" if i < num else ("current" if i == num else "")
-        dots += f'<div class="step-dot {cls}"></div>'
-    st.markdown(f"""
-    <div class="step-progress">{dots}</div>
-    <div class="step-header">
-        <div class="step-num">{num}</div>
-        <div>
-            <div class="step-title">{title}</div>
-            <div class="step-desc">{desc}</div>
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-
-def render_ai_box(content, style="normal"):
-    cls = {"normal": "ai-box", "warn": "ai-box-warn", "ok": "ai-box-ok"}.get(style, "ai-box")
-    label = {"normal": "🎯 AI批改", "warn": "⚠️ AI批改", "ok": "✅ AI批改"}.get(style, "🎯 AI批改")
-    st.markdown(f"""
-    <div class="{cls}">
-        <div class="ai-label">{label}</div>
-        <div class="ai-text">{content}</div>
-    </div>""", unsafe_allow_html=True)
-
-
+# ==================== 主程序 ====================
 def main():
     st.set_page_config(page_title="Al Brooks 心智决策训练器 V5.0", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     init_state()
 
-    df = st.session_state.df
-    phase = st.session_state.phase
-    symbol = st.session_state.symbol
-    period = st.session_state.period
-    struct_data = st.session_state.struct_data
-    obs_end = st.session_state.obs_end
-
-    # 侧边栏
+    # 侧边栏：选择品种与展现得分
     with st.sidebar:
-        st.markdown("## Al Brooks 训练器")
-        st.caption("心智决策 · 先判环境")
-        st.markdown("---")
-
+        st.title("Brooks PA 训练沙盘")
+        st.caption("心智模型：先判环境，再定方向")
+        st.write("---")
+        
         if st.session_state.round_num > 0:
-            st.markdown("**五步能力**")
+            st.write(f"**当前测试进度: 第 {st.session_state.round_num} 轮**")
             for step in FIVE_STEPS:
-                acc = get_step_accuracy(step)
-                color = "#22c55e" if acc >= 70 else ("#f97316" if acc >= 40 else "#ef4444")
-                st.markdown(f"""
-                <div style="margin:5px 0;">
-                    <div style="display:flex;justify-content:space-between;font-size:12px;">
-                        <span style="color:#555;">{step}</span>
-                        <span style="color:{color};">{acc}%</span>
-                    </div>
-                    <div style="background:#eee;border-radius:2px;height:4px;"><div style="background:{color};width:{max(4,acc)}%;height:4px;"></div></div>
-                </div>""", unsafe_allow_html=True)
-            
+                scs = st.session_state.scores.get(step, [])
+                acc = int(np.mean(scs) * 100) if scs else 0
+                st.write(f"· {step}: `{acc}%` 正确率")
             if st.session_state.verification_scores:
-                surv = np.mean(st.session_state.verification_scores) * 100
-                st.markdown(f"**假设存活率**<br><span style='font-size:20px;font-weight:700;'>{surv:.0f}%</span>", unsafe_allow_html=True)
-
-        st.markdown("---")
-        period_sel = st.selectbox("周期", list(PERIODS.keys()), format_func=lambda x: PERIODS[x], index=1)
-
+                st.write(f"· 终审自洽率: `{int(np.mean(st.session_state.verification_scores)*100)}%`")
+        
+        st.write("---")
+        period_sel = st.selectbox("选择图表周期", list(PERIODS.keys()), format_func=lambda x: PERIODS[x], index=1)
         for cat, codes in EXCHANGES.items():
-            with st.expander(cat, expanded=False):
-                cols = st.columns(2)
-                for i, code in enumerate(codes):
-                    if cols[i%2].button(code, key=f"s_{code}", use_container_width=True):
+            with st.expander(cat):
+                for code in codes:
+                    if st.button(f"📊 {SYMBOL_NAMES[code]} ({code})", key=f"btn_{code}", use_container_width=True):
                         if load_sym(code, period_sel):
-                            if start_round(st.session_state.df):
-                                st.session_state.phase = "step2"  # 第一步是判环境
-                                st.session_state.practice_count += 1
-                                st.session_state.session_start = time.time()
+                            if start_round(st.session_state.df): st.session_state.phase = "step2"
                         st.rerun()
 
-        st.markdown("---")
-        if st.button("🎲 随机品种", use_container_width=True):
-            code = random.choice([c for codes in EXCHANGES.values() for c in codes])
-            if load_sym(code, period_sel):
-                if start_round(st.session_state.df):
-                    st.session_state.phase = "step2"
-                    st.session_state.practice_count += 1
-                    st.session_state.session_start = time.time()
+    # 主操作区路由
+    phase = st.session_state.phase
+    if phase == "select":
+        st.info("💡 请在左侧选择任意商品期货/股指期货品种，系统将随机截取一段历史K线开启盲盒训练。")
+        return
+
+    # 渲染图表 (Step 1-5 阶段严格隐藏后市，extra_bars=0)
+    is_verifying = (phase in ["verify", "result"])
+    eb = st.session_state.ver_total if is_verifying else 0
+    fig = build_chart(st.session_state.df, st.session_state.obs_end, extra_bars=eb, sh=st.session_state.struct_data.get("swing_highs"), sl=st.session_state.struct_data.get("swing_lows"))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 展现量化上下文
+    with st.expander("🔍 展开当前K线微观多空博弈数据 (数字视觉)", expanded=True):
+        st.markdown(f'<div class="context-box">{st.session_state.context}</div>', unsafe_allow_html=True)
+
+    # 阶段分流交互
+    if phase == "step2":
+        st.markdown('<div class="step-header"><div class="step-num">1</div><div class="step-title">Market State (判断当前市场处于什么容器)</div></div>', unsafe_allow_html=True)
+        st.session_state.s2_state = st.radio("当前市场状态", ["强趋势推进 (Spike / Strong Trend)", "弱趋势通道 (Channel / Weak Trend)", "交易区间 (Trading Range / 横盘震荡)"])
+        st.session_state.s2_evidence = st.text_area("请给出你的PA证据（如重叠度、均线偏离、高低点抬升情况）:")
+        if st.button("提交环境判定，进入方向选择"):
+            st.session_state.phase = "step1"
             st.rerun()
 
-        if phase not in ("select", "report"):
-            st.markdown("---")
-            if st.button("📊 结束出报告", use_container_width=True):
-                st.session_state.phase = "report"
-                st.rerun()
-            if st.button("🔄 重置", use_container_width=True):
-                for k in list(st.session_state.keys()): del st.session_state[k]
-                st.rerun()
+    elif phase == "step1":
+        st.markdown('<div class="step-header"><div class="step-num">2</div><div class="step-title">Always In (如果被迫必须持仓，你站哪边？)</div></div>', unsafe_allow_html=True)
+        st.write(f"先前判定的环境：`{st.session_state.s2_state}`")
+        st.session_state.s1_dir = st.radio("Always In 方向", ["Always In 多头 (买方占优)", "Always In 空头 (卖方占优)", "没有任何倾向 (完全无方向区间)"])
+        st.session_state.s1_confidence = st.select_slider("你的确信度等级", options=CONFIDENCE_LEVELS)
+        st.session_state.s1_reason = st.text_area("请用1句话阐述你站此方向的核心痛点或反方力竭证据:")
+        if st.button("提交方向，进入空间评估"):
+            # 顺便触发 AI 批改
+            p = STEP2_GRADER.format(context=st.session_state.context, state=st.session_state.s2_state, direction=st.session_state.s1_dir, confidence=st.session_state.s1_confidence, reason=st.session_state.s1_reason)
+            st.session_state.grade_s2 = call_ai(p)
+            parse_grade_and_score(st.session_state.grade_s2, "Always In")
+            st.session_state.phase = "step3"
+            st.rerun()
 
-        st.markdown("""
-        <div class="brooks-note">
-        "The question is never what the market is doing. It's what you should do about it."<br>— Al Brooks
-        </div>
+    elif phase == "step3":
+        st.markdown('<div class="step-header"><div class="step-num">3</div><div class="step-title">Location (空间与风控盈亏比预估)</div></div>', unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        st.session_state.s3_upside = col1.number_input("预估至上方局部阻力处的安全获利空间 (ATR倍数)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
+        st.session_state.s3_downside = col2.number_input("预估跌破至反向保护位需承受的风险 (ATR倍数)", min_value=0.1, max_value=10.0, value=1.0, step=0.5)
+        st.session_state.s3_reason = st.text_area("你选择的高点阻力或低点支撑的K线参照依据是？")
+        if st.button("提交空间评估，寻找信号棒"):
+            p = STEP3_GRADER.format(context=st.session_state.context, upside=st.session_state.s3_upside, downside=st.session_state.s3_downside, reason=st.session_state.s3_reason)
+            st.session_state.grade_s3 = call_ai(p)
+            parse_grade_and_score(st.session_state.grade_s3, "Location")
+            st.session_state.phase = "step4"
+            st.rerun()
+
+    elif phase == "step4":
+        st.markdown('<div class="step-header"><div class="step-num">4</div><div class="step-title">Signal (卡定当前的微观信号K线形态)</div></div>', unsafe_allow_html=True)
+        st.session_state.s4_signal_mode = st.multiselect("当前临近K线触发了哪些 Brooks 经典信号棒模式？", SIGNAL_OPTIONS, default=["趋势K线（Trend Bar）"])
+        st.session_state.s4_kref = st.text_area("请指定具体是哪根K线（如倒数第1根、或某局部高低點組合成的H2），并写出其引线或收盘特征：")
+        if st.button("提交信号，制定最终交易计划"):
+            p = STEP4_GRADER.format(context=st.session_state.context, signal_mode=",".join(st.session_state.s4_signal_mode), k_ref=st.session_state.s4_kref)
+            st.session_state.grade_s4 = call_ai(p)
+            parse_grade_and_score(st.session_state.grade_s4, "Signal")
+            st.session_state.phase = "step5"
+            st.rerun()
+
+    elif phase == "step5":
+        st.markdown('<div class="step-header"><div class="step-num">5</div><div class="step-title">Trade Plan (交易计划与执行)</div></div>', unsafe_allow_html=True)
+        st.session_state.s5_decision = st.radio("你的最终操作决策", ["顺势做多", "逆势高抛低吸", "完全放弃，继续空仓观望"])
+        st.session_state.s5_winrate_type = st.selectbox("你此笔交易所依托的交易员方程类型", WIN_RATE_TYPES)
+        st.session_state.s5_abandon = st.text_area("【极为重要】你的放弃/离场条件是什么？（一旦发生什么，证明你的假设彻底破灭？）")
+        if st.button("封存交易计划，揭晓后市盲盒！"):
+            loc_summary = f"盈亏比空间: {st.session_state.s3_upside}对{st.session_state.s3_downside}"
+            sig_summary = ",".join(st.session_state.s4_signal_mode)
+            p = STEP5_GRADER.format(state=st.session_state.s2_state, direction=st.session_state.s1_dir, confidence=st.session_state.s1_confidence, location=loc_summary, signal=sig_summary, decision=st.session_state.s5_decision, win_rate_type=st.session_state.s5_winrate_type, abandon=st.session_state.s5_abandon)
+            st.session_state.grade_s5 = call_ai(p)
+            parse_grade_and_score(st.session_state.grade_s5, "Trade Plan")
+            st.session_state.phase = "verify"
+            st.rerun()
+
+    elif phase == "verify":
+        st.markdown("### 🎲 后市盲盒已揭晓！请对比图表蓝色高亮区进行【自我评判】")
+        st.warning("请观察右侧新长出的 K 線走勢。在你當初設定的放棄條件觸發前，行情是如期運行，還是陷入了橫盤或被反殺？")
+        st.session_state.ver_choice = st.radio("你认为你的原始交易假设目前处于什么状态？", VER_OPTIONS)
+        st.session_state.ver_reason = st.text_area("请结合后市长出的具体K线（如发生了惊喜突围、或连续重叠）阐述你的复盘理由：")
+        
+        if st.button("提交复盘，查看 Al Brooks 终审裁决与教练点评"):
+            new_bars_txt = get_new_bars_text(st.session_state.df, st.session_state.obs_end, st.session_state.ver_total)
+            p = VERIFICATION_GRADER.format(state=st.session_state.s2_state, direction=st.session_state.s1_dir, abandon=st.session_state.s5_abandon, ver_total=st.session_state.ver_total, new_bars=new_bars_txt, ver_choice=st.session_state.ver_choice, ver_reason=st.session_state.ver_reason)
+            st.session_state.grade_ver = call_ai(p)
+            
+            # 判断终审是否正确
+            if "correct" in st.session_state.grade_ver.lower(): st.session_state.verification_scores.append(1.0)
+            else: st.session_state.verification_scores.append(0.0)
+            st.session_state.phase = "result"
+            st.rerun()
+
+    elif phase == "result":
+        st.success("🏁 本轮盲盒心智推演已全部结束，以下是 Al Brooks 灵魂导师给你的全套逐步批改报告：")
+        
+        # 逐步展现 AI 报告
+        with st.expander("1. 查看【环境与方向 (Market State & Always In)】导师批改", expanded=True): st.markdown(f'<div class="ai-box">{st.session_state.grade_s2}</div>', unsafe_allow_html=True)
+        with st.expander("2. 查看【空间与风控 (Location)】导师批改", expanded=True): st.markdown(f'<div class="ai-box">{st.session_state.grade_s3}</div>', unsafe_allow_html=True)
+        with st.expander("3. 查看【微观信号棒 (Signal)】导师批改", expanded=True): st.markdown(f'<div class="ai-box">{st.session_state.grade_s4}</div>', unsafe_allow_html=True)
+        with st.expander("4. 查看【计划自洽性 (Trade Plan)】导师批改", expanded=True): st.markdown(f'<div class="ai-box">{st.session_state.grade_s5}</div>', unsafe_allow_html=True)
+        with st.expander("5. 👑 【后市验证·终审裁决】", expanded=True): st.markdown(f'<div class="ai-box" style="border: 2px solid #22c55e;">{st.session_state.grade_ver}</div>', unsafe_allow_html=True)
+
+        if st.button("开启下一轮随机盲盒测试", type="primary"):
+            if start_round(st.session_state.df): st.session_state.phase = "step2"
+            st.rerun()
+
+if __name__ == "__main__":
+    main()
